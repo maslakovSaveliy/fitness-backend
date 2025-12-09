@@ -1,8 +1,22 @@
 import random
 import re
-from openai import AsyncOpenAI
+from datetime import datetime, timezone, timedelta
+
+from openai import AsyncOpenAI, APIError, RateLimitError, APIConnectionError
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type
+)
+
 from app.config import get_settings
+from app.logging_config import get_logger
 from app.db import supabase_client
+from app.cache import (
+    cache_get, cache_set, make_cache_key, hash_dict,
+    CacheConfig
+)
 from .prompts import (
     WORKOUT_SPLITS,
     SPLIT_DESCRIPTIONS,
@@ -12,16 +26,69 @@ from .prompts import (
     FOOD_CLARIFICATION_PROMPT
 )
 
+logger = get_logger(__name__)
 settings = get_settings()
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 
+OPENAI_RETRYABLE_ERRORS = (APIError, RateLimitError, APIConnectionError)
+
 
 class AIService:
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(OPENAI_RETRYABLE_ERRORS),
+        before_sleep=lambda retry_state: logger.warning(
+            f"OpenAI request failed, retrying in {retry_state.next_action.sleep} seconds..."
+        )
+    )
+    async def _call_openai(
+        self,
+        messages: list[dict],
+        max_tokens: int = 1200,
+        temperature: float = 0.4
+    ) -> str:
+        """Вызов OpenAI API с retry логикой."""
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        return response.choices[0].message.content or ""
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(OPENAI_RETRYABLE_ERRORS),
+        before_sleep=lambda retry_state: logger.warning(
+            f"OpenAI Vision request failed, retrying..."
+        )
+    )
+    async def _call_openai_vision(
+        self,
+        system_prompt: str,
+        user_content: list[dict],
+        max_tokens: int = 500
+    ) -> str:
+        """Вызов OpenAI Vision API с retry логикой."""
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            max_tokens=max_tokens
+        )
+        return response.choices[0].message.content or ""
+
     async def generate_workout(
         self,
         user: dict,
         target_muscle_group: str | None = None
     ) -> str:
+        """Генерация персонализированной тренировки."""
         exercise_count = random.randint(5, 8)
         tip_type = random.choice(TIP_TYPES)
         
@@ -77,57 +144,72 @@ class AIService:
             exercises_info=exercises_info
         )
         
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Ты фитнес-бот. Отвечай всегда только на русском языке."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.4,
-            max_tokens=1200
-        )
+        logger.info(f"Generating workout for user {user['id']}, muscle group: {chosen_group}")
         
-        workout_text = response.choices[0].message.content
+        try:
+            workout_text = await self._call_openai(
+                messages=[
+                    {"role": "system", "content": "Ты фитнес-бот. Отвечай всегда только на русском языке."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1200,
+                temperature=0.4
+            )
+        except Exception as e:
+            logger.error(f"Failed to generate workout after retries: {e}")
+            raise
         
         await self._update_last_muscle_group(user["telegram_id"], chosen_group)
         
         return workout_text
 
     async def analyze_food_photo(self, image_url: str) -> str:
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": FOOD_ANALYSIS_PROMPT},
-                {"role": "user", "content": [
+        """Анализ фото еды."""
+        logger.info(f"Analyzing food photo: {image_url[:50]}...")
+        
+        try:
+            return await self._call_openai_vision(
+                system_prompt=FOOD_ANALYSIS_PROMPT,
+                user_content=[
                     {"type": "text", "text": FOOD_ANALYSIS_PROMPT},
                     {"type": "image_url", "image_url": {"url": image_url}}
-                ]}
-            ],
-            max_tokens=500
-        )
-        return response.choices[0].message.content
+                ],
+                max_tokens=500
+            )
+        except Exception as e:
+            logger.error(f"Failed to analyze food photo: {e}")
+            raise
 
     async def analyze_food_with_clarification(
         self,
         image_url: str,
         clarification: str
     ) -> str:
+        """Анализ фото еды с уточнением от пользователя."""
         prompt = FOOD_CLARIFICATION_PROMPT.format(clarification=clarification)
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": [
+        
+        logger.info(f"Analyzing food photo with clarification: {clarification}")
+        
+        try:
+            return await self._call_openai_vision(
+                system_prompt=prompt,
+                user_content=[
                     {"type": "text", "text": clarification},
                     {"type": "image_url", "image_url": {"url": image_url}}
-                ]}
-            ],
-            max_tokens=500
-        )
-        return response.choices[0].message.content
+                ],
+                max_tokens=500
+            )
+        except Exception as e:
+            logger.error(f"Failed to analyze food photo with clarification: {e}")
+            raise
 
     async def _calculate_attendance(self, user_id: str) -> dict:
-        from datetime import datetime, timedelta
+        """Расчёт посещаемости тренировок с кэшированием."""
+        cache_key = make_cache_key("user", user_id, "attendance")
+        
+        cached = await cache_get(cache_key)
+        if cached:
+            return cached
         
         try:
             workouts = await supabase_client.get(
@@ -136,20 +218,34 @@ class AIService:
             )
             
             if not workouts:
-                return {
+                result = {
                     "real_frequency": 0,
                     "total_workouts": 0,
                     "average_weekly": 0,
                     "recommended_split": WORKOUT_SPLITS[1]
                 }
+                await cache_set(cache_key, result, CacheConfig.WORKOUT_STATS_TTL)
+                return result
             
-            cutoff_date = datetime.utcnow() - timedelta(days=30)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
             recent_workouts = []
             
             for workout in workouts:
-                workout_date = datetime.fromisoformat(workout["date"])
-                if workout_date >= cutoff_date:
-                    recent_workouts.append(workout)
+                workout_date_str = workout.get("date", "")
+                try:
+                    if "T" in workout_date_str:
+                        workout_date = datetime.fromisoformat(
+                            workout_date_str.replace("Z", "+00:00")
+                        )
+                    else:
+                        workout_date = datetime.strptime(
+                            workout_date_str, "%Y-%m-%d"
+                        ).replace(tzinfo=timezone.utc)
+                    
+                    if workout_date >= cutoff_date:
+                        recent_workouts.append(workout)
+                except (ValueError, TypeError):
+                    continue
             
             total_workouts = len(recent_workouts)
             weeks_in_period = 30 / 7
@@ -157,15 +253,18 @@ class AIService:
             
             real_frequency = min(5, max(1, round(average_weekly)))
             
-            return {
+            result = {
                 "real_frequency": real_frequency,
                 "total_workouts": total_workouts,
                 "average_weekly": round(average_weekly, 1),
                 "recommended_split": WORKOUT_SPLITS.get(real_frequency, WORKOUT_SPLITS[3])
             }
             
+            await cache_set(cache_key, result, CacheConfig.WORKOUT_STATS_TTL)
+            return result
+            
         except Exception as e:
-            print(f"Error calculating attendance: {e}")
+            logger.error(f"Error calculating attendance: {e}")
             return {
                 "real_frequency": 3,
                 "total_workouts": 0,
@@ -174,6 +273,7 @@ class AIService:
             }
 
     def _should_use_supersets(self, user: dict) -> bool:
+        """Определить, использовать ли суперсеты."""
         if "supersets_enabled" in user and user["supersets_enabled"] is not None:
             return user["supersets_enabled"]
         
@@ -194,6 +294,7 @@ class AIService:
         return any(keyword in workout_formats for keyword in superset_keywords)
 
     async def _get_workout_history_info(self, user_id: str) -> tuple[str, str]:
+        """Получить информацию о предыдущих тренировках."""
         workouts = await supabase_client.get(
             "workouts",
             {"user_id": f"eq.{user_id}", "order": "date.desc", "limit": "3"}
@@ -235,6 +336,7 @@ class AIService:
         return workout_history_info, exercises_info
 
     def _extract_exercise_names(self, details: str) -> list[str]:
+        """Извлечь названия упражнений из текста тренировки."""
         lines = details.split('\n')
         exercises = []
         for line in lines:
@@ -244,6 +346,7 @@ class AIService:
         return exercises
 
     async def _update_last_muscle_group(self, telegram_id: int, muscle_group: str) -> None:
+        """Обновить последнюю тренированную группу мышц."""
         try:
             await supabase_client.update(
                 "users",
@@ -251,8 +354,7 @@ class AIService:
                 {"last_muscle_group": muscle_group}
             )
         except Exception as e:
-            print(f"Error updating last_muscle_group: {e}")
+            logger.error(f"Error updating last_muscle_group: {e}")
 
 
 ai_service = AIService()
-

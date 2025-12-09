@@ -1,5 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
+
 from app.dependencies import get_current_user, get_current_paid_user
+from app.rate_limit import limiter, get_ai_rate_limit
 from .schemas import (
     WorkoutCreate,
     WorkoutResponse,
@@ -21,8 +23,25 @@ from .service import (
 router = APIRouter(prefix="/workouts", tags=["workouts"])
 
 
+def _build_workout_response(w: dict) -> WorkoutResponse:
+    """Построить ответ с данными тренировки."""
+    return WorkoutResponse(
+        id=w["id"],
+        user_id=w["user_id"],
+        date=w["date"],
+        workout_type=w["workout_type"],
+        details=w["details"],
+        calories_burned=w.get("calories_burned"),
+        rating=w.get("rating"),
+        comment=w.get("comment"),
+        created_at=w.get("created_at")
+    )
+
+
 @router.get("", response_model=WorkoutListResponse)
+@limiter.limit("30/minute")
 async def list_workouts(
+    request: Request,
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
     user: dict = Depends(get_current_user)
@@ -30,26 +49,15 @@ async def list_workouts(
     """Получить список тренировок пользователя."""
     workouts, total = await get_user_workouts(user["id"], limit, offset)
     
-    items = [
-        WorkoutResponse(
-            id=w["id"],
-            user_id=w["user_id"],
-            date=w["date"],
-            workout_type=w["workout_type"],
-            details=w["details"],
-            calories_burned=w.get("calories_burned"),
-            rating=w.get("rating"),
-            comment=w.get("comment"),
-            created_at=w.get("created_at")
-        )
-        for w in workouts
-    ]
+    items = [_build_workout_response(w) for w in workouts]
     
     return WorkoutListResponse(items=items, total=total)
 
 
 @router.post("", response_model=WorkoutResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/minute")
 async def add_workout(
+    request: Request,
     data: WorkoutCreate,
     user: dict = Depends(get_current_paid_user)
 ):
@@ -62,21 +70,13 @@ async def add_workout(
             detail="Failed to create workout"
         )
     
-    return WorkoutResponse(
-        id=workout["id"],
-        user_id=workout["user_id"],
-        date=workout["date"],
-        workout_type=workout["workout_type"],
-        details=workout["details"],
-        calories_burned=workout.get("calories_burned"),
-        rating=workout.get("rating"),
-        comment=workout.get("comment"),
-        created_at=workout.get("created_at")
-    )
+    return _build_workout_response(workout)
 
 
 @router.post("/generate", response_model=WorkoutGenerateResponse)
+@limiter.limit(get_ai_rate_limit())
 async def generate_new_workout(
+    request: Request,
     data: WorkoutGenerateRequest,
     user: dict = Depends(get_current_paid_user)
 ):
@@ -90,7 +90,9 @@ async def generate_new_workout(
 
 
 @router.post("/{workout_id}/rate", response_model=WorkoutResponse)
+@limiter.limit("20/minute")
 async def rate_workout_endpoint(
+    request: Request,
     workout_id: str,
     data: WorkoutRateRequest,
     user: dict = Depends(get_current_user)
@@ -117,28 +119,24 @@ async def rate_workout_endpoint(
             detail="Failed to rate workout"
         )
     
-    return WorkoutResponse(
-        id=workout["id"],
-        user_id=workout["user_id"],
-        date=workout["date"],
-        workout_type=workout["workout_type"],
-        details=workout["details"],
-        calories_burned=workout.get("calories_burned"),
-        rating=workout.get("rating"),
-        comment=workout.get("comment"),
-        created_at=workout.get("created_at")
-    )
+    return _build_workout_response(workout)
 
 
 @router.get("/stats", response_model=WorkoutStatsResponse)
-async def get_stats(user: dict = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def get_stats(
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
     """Получить статистику тренировок."""
     stats = await get_workout_stats(user["id"])
     return WorkoutStatsResponse(**stats)
 
 
 @router.get("/{workout_id}", response_model=WorkoutResponse)
+@limiter.limit("30/minute")
 async def get_workout(
+    request: Request,
     workout_id: str,
     user: dict = Depends(get_current_user)
 ):
@@ -151,15 +149,4 @@ async def get_workout(
             detail="Workout not found"
         )
     
-    return WorkoutResponse(
-        id=workout["id"],
-        user_id=workout["user_id"],
-        date=workout["date"],
-        workout_type=workout["workout_type"],
-        details=workout["details"],
-        calories_burned=workout.get("calories_burned"),
-        rating=workout.get("rating"),
-        comment=workout.get("comment"),
-        created_at=workout.get("created_at")
-    )
-
+    return _build_workout_response(workout)

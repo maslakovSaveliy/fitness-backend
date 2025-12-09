@@ -1,5 +1,11 @@
-from fastapi import APIRouter, HTTPException, status
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, HTTPException, status, Request
+
 from app.config import get_settings
+from app.logging_config import get_logger
+from app.rate_limit import limiter
+from app.db import supabase_client
 from .schemas import TelegramAuthRequest, TokenResponse, UserResponse
 from .service import (
     verify_telegram_init_data,
@@ -7,20 +13,21 @@ from .service import (
     get_or_create_user,
     user_has_profile
 )
-from app.db import supabase_client
 
+logger = get_logger(__name__)
 settings = get_settings()
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/telegram", response_model=TokenResponse)
-async def authenticate_telegram(request: TelegramAuthRequest):
+@limiter.limit("10/minute")
+async def authenticate_telegram(request: Request, data: TelegramAuthRequest):
     """
     Авторизация через Telegram WebApp initData.
     Возвращает JWT токен для дальнейших запросов.
     """
-    tg_user = verify_telegram_init_data(request.init_data)
+    tg_user = verify_telegram_init_data(data.init_data)
     
     if not tg_user:
         raise HTTPException(
@@ -56,7 +63,7 @@ async def authenticate_telegram(request: TelegramAuthRequest):
 
 
 @router.post("/dev", response_model=TokenResponse)
-async def dev_authenticate():
+async def dev_authenticate(request: Request):
     """
     Dev-режим авторизации для локального тестирования.
     Работает только если DEBUG=true.
@@ -67,9 +74,11 @@ async def dev_authenticate():
             detail="Dev auth is only available in debug mode"
         )
     
+    now = datetime.now(timezone.utc).isoformat()
+    
     user = await supabase_client.get_one(
         "users",
-        {"is_paid": "eq.true", "paid_until": f"gt.{__import__('datetime').datetime.now().isoformat()}"}
+        {"is_paid": "eq.true", "paid_until": f"gt.{now}"}
     )
     
     if not user:
@@ -94,8 +103,9 @@ async def dev_authenticate():
         has_profile=user_has_profile(user)
     )
     
+    logger.warning(f"Dev auth used for user {user['id']}")
+    
     return TokenResponse(
         access_token=access_token,
         user=user_response
     )
-
