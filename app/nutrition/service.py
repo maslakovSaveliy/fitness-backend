@@ -1,8 +1,13 @@
 import json
-from datetime import date as dt_date
+from datetime import date as dt_date, datetime, timezone
+
 from app.db import supabase_client
 from app.ai import ai_service
+from app.logging_config import get_logger
+from app.cache import cache_get, cache_set, make_cache_key, invalidate_user_cache, CacheConfig
 from .schemas import MealCreate, NutritionPlanCreate, FoodAnalyzeResponse
+
+logger = get_logger(__name__)
 
 
 async def get_user_meals(
@@ -11,6 +16,7 @@ async def get_user_meals(
     offset: int = 0,
     date_filter: dt_date | None = None
 ) -> tuple[list[dict], int]:
+    """Получить приёмы пищи пользователя с пагинацией."""
     params = {
         "user_id": f"eq.{user_id}",
         "order": "created_at.desc",
@@ -21,19 +27,13 @@ async def get_user_meals(
     if date_filter:
         params["date"] = f"eq.{date_filter.isoformat()}"
     
-    meals = await supabase_client.get("meals", params)
-    
-    count_params = {"user_id": f"eq.{user_id}", "select": "id"}
-    if date_filter:
-        count_params["date"] = f"eq.{date_filter.isoformat()}"
-    
-    count_result = await supabase_client.get("meals", count_params)
-    total = len(count_result) if count_result else 0
+    meals, total = await supabase_client.get_with_count("meals", params)
     
     return meals, total
 
 
-async def create_meal(user_id: str, data: MealCreate) -> dict:
+async def create_meal(user_id: str, data: MealCreate) -> dict | None:
+    """Создать запись о приёме пищи."""
     meal_date = data.date or dt_date.today()
     
     meal_data = {
@@ -57,6 +57,8 @@ async def create_meal(user_id: str, data: MealCreate) -> dict:
     
     if result:
         await update_daily_nutrition_stats(user_id, meal_date)
+        await invalidate_user_cache(user_id)
+        logger.info(f"Meal created for user {user_id}")
     
     return result[0] if result else None
 
@@ -65,6 +67,7 @@ async def analyze_food_photo(
     image_url: str,
     clarification: str | None = None
 ) -> FoodAnalyzeResponse:
+    """Анализировать фото еды через AI."""
     if clarification:
         response = await ai_service.analyze_food_with_clarification(image_url, clarification)
     else:
@@ -83,8 +86,8 @@ async def analyze_food_photo(
                 fats=data.get("fats"),
                 carbs=data.get("carbs")
             )
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse food analysis JSON: {e}")
     
     return FoodAnalyzeResponse(description="Не удалось распознать блюдо")
 
@@ -93,7 +96,13 @@ async def get_daily_nutrition_stats(
     user_id: str,
     date_filter: dt_date | None = None
 ) -> dict:
+    """Получить статистику питания за день с кэшированием."""
     target_date = date_filter or dt_date.today()
+    cache_key = make_cache_key("user", user_id, "nutrition", target_date.isoformat())
+    
+    cached = await cache_get(cache_key)
+    if cached:
+        return cached
     
     stats = await supabase_client.get_one(
         "daily_nutrition_stats",
@@ -101,12 +110,14 @@ async def get_daily_nutrition_stats(
     )
     
     if stats:
+        await cache_set(cache_key, stats, CacheConfig.DAILY_NUTRITION_TTL)
         return stats
     
     return await update_daily_nutrition_stats(user_id, target_date)
 
 
 async def update_daily_nutrition_stats(user_id: str, date_filter: dt_date) -> dict:
+    """Обновить дневную статистику питания."""
     meals = await supabase_client.get(
         "meals",
         {
@@ -152,10 +163,15 @@ async def update_daily_nutrition_stats(user_id: str, date_filter: dt_date) -> di
     else:
         result = await supabase_client.insert("daily_nutrition_stats", stats_data)
     
-    return result[0] if result else stats_data
+    cache_key = make_cache_key("user", user_id, "nutrition", date_filter.isoformat())
+    final_stats = result[0] if result else stats_data
+    await cache_set(cache_key, final_stats, CacheConfig.DAILY_NUTRITION_TTL)
+    
+    return final_stats
 
 
 async def get_active_nutrition_plan(user_id: str) -> dict | None:
+    """Получить активный план питания."""
     return await supabase_client.get_one(
         "nutrition_plans",
         {
@@ -167,7 +183,8 @@ async def get_active_nutrition_plan(user_id: str) -> dict | None:
     )
 
 
-async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate) -> dict:
+async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate) -> dict | None:
+    """Создать новый план питания."""
     await supabase_client.update(
         "nutrition_plans",
         {"user_id": f"eq.{user_id}", "is_active": "eq.true"},
@@ -185,10 +202,15 @@ async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate) -> dict
     }
     
     result = await supabase_client.insert("nutrition_plans", plan_data)
+    
+    if result:
+        logger.info(f"Nutrition plan created for user {user_id}")
+    
     return result[0] if result else None
 
 
 def calculate_kbju_targets(user: dict) -> dict:
+    """Рассчитать целевые показатели КБЖУ."""
     try:
         weight = float(user.get('weight') or 70)
         height = float(user.get('height') or 175)
@@ -239,6 +261,7 @@ def calculate_kbju_targets(user: dict) -> dict:
 
 
 async def get_kbju_recommendations(user: dict, daily_stats: dict) -> dict:
+    """Получить рекомендации по КБЖУ."""
     targets = calculate_kbju_targets(user)
     
     current_calories = daily_stats.get('total_calories', 0) or 0
@@ -279,4 +302,3 @@ async def get_kbju_recommendations(user: dict, daily_stats: dict) -> dict:
         "remaining_carbs": remaining_carbs,
         "recommendations": recommendations
     }
-

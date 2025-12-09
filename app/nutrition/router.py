@@ -1,6 +1,9 @@
 from datetime import date
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request
+
 from app.dependencies import get_current_user, get_current_paid_user
+from app.rate_limit import limiter, get_ai_rate_limit
 from .schemas import (
     MealCreate,
     MealResponse,
@@ -25,8 +28,26 @@ from .service import (
 router = APIRouter(prefix="/nutrition", tags=["nutrition"])
 
 
+def _build_meal_response(m: dict) -> MealResponse:
+    """Построить ответ с данными приёма пищи."""
+    return MealResponse(
+        id=m["id"],
+        user_id=m["user_id"],
+        date=m["date"],
+        description=m["description"],
+        calories=m.get("calories"),
+        proteins=m.get("proteins"),
+        fats=m.get("fats"),
+        carbs=m.get("carbs"),
+        photo_url=m.get("photo_url"),
+        created_at=m.get("created_at")
+    )
+
+
 @router.get("/meals", response_model=MealListResponse)
+@limiter.limit("30/minute")
 async def list_meals(
+    request: Request,
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
     date_filter: date | None = Query(None, alias="date"),
@@ -35,27 +56,15 @@ async def list_meals(
     """Получить список приемов пищи."""
     meals, total = await get_user_meals(user["id"], limit, offset, date_filter)
     
-    items = [
-        MealResponse(
-            id=m["id"],
-            user_id=m["user_id"],
-            date=m["date"],
-            description=m["description"],
-            calories=m.get("calories"),
-            proteins=m.get("proteins"),
-            fats=m.get("fats"),
-            carbs=m.get("carbs"),
-            photo_url=m.get("photo_url"),
-            created_at=m.get("created_at")
-        )
-        for m in meals
-    ]
+    items = [_build_meal_response(m) for m in meals]
     
     return MealListResponse(items=items, total=total)
 
 
 @router.post("/meals", response_model=MealResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/minute")
 async def add_meal(
+    request: Request,
     data: MealCreate,
     user: dict = Depends(get_current_paid_user)
 ):
@@ -68,22 +77,13 @@ async def add_meal(
             detail="Failed to create meal"
         )
     
-    return MealResponse(
-        id=meal["id"],
-        user_id=meal["user_id"],
-        date=meal["date"],
-        description=meal["description"],
-        calories=meal.get("calories"),
-        proteins=meal.get("proteins"),
-        fats=meal.get("fats"),
-        carbs=meal.get("carbs"),
-        photo_url=meal.get("photo_url"),
-        created_at=meal.get("created_at")
-    )
+    return _build_meal_response(meal)
 
 
 @router.post("/meals/analyze", response_model=FoodAnalyzeResponse)
+@limiter.limit(get_ai_rate_limit())
 async def analyze_food(
+    request: Request,
     data: FoodAnalyzeRequest,
     user: dict = Depends(get_current_paid_user)
 ):
@@ -93,10 +93,13 @@ async def analyze_food(
 
 
 @router.get("/stats/today", response_model=DailyNutritionStatsResponse)
-async def get_today_stats(user: dict = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def get_today_stats(
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
     """Получить статистику питания за сегодня."""
-    from datetime import date as dt_date
-    today = dt_date.today()
+    today = date.today()
     
     stats = await get_daily_nutrition_stats(user["id"], today)
     
@@ -111,7 +114,9 @@ async def get_today_stats(user: dict = Depends(get_current_user)):
 
 
 @router.get("/stats/{target_date}", response_model=DailyNutritionStatsResponse)
+@limiter.limit("30/minute")
 async def get_date_stats(
+    request: Request,
     target_date: date,
     user: dict = Depends(get_current_user)
 ):
@@ -129,10 +134,13 @@ async def get_date_stats(
 
 
 @router.get("/recommendations", response_model=KBJURecommendations)
-async def get_recommendations(user: dict = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def get_recommendations(
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
     """Получить рекомендации по КБЖУ на сегодня."""
-    from datetime import date as dt_date
-    today = dt_date.today()
+    today = date.today()
     
     stats = await get_daily_nutrition_stats(user["id"], today)
     recommendations = await get_kbju_recommendations(user, stats)
@@ -141,7 +149,11 @@ async def get_recommendations(user: dict = Depends(get_current_user)):
 
 
 @router.get("/plans/active", response_model=NutritionPlanResponse | None)
-async def get_active_plan(user: dict = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def get_active_plan(
+    request: Request,
+    user: dict = Depends(get_current_user)
+):
     """Получить активный план питания."""
     plan = await get_active_nutrition_plan(user["id"])
     
@@ -166,7 +178,9 @@ async def get_active_plan(user: dict = Depends(get_current_user)):
 
 
 @router.post("/plans", response_model=NutritionPlanResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
 async def create_plan(
+    request: Request,
     data: NutritionPlanCreate,
     user: dict = Depends(get_current_paid_user)
 ):
@@ -194,4 +208,3 @@ async def create_plan(
         target_carbs=plan.get("target_carbs"),
         created_at=plan.get("created_at")
     )
-
