@@ -31,7 +31,10 @@ async def get_user_workouts(
     params = {
         "user_id": f"eq.{user_id}",
         "status": "eq.completed",
-        "order": "date.desc",
+        # Для "последней тренировки" важно сортировать по времени создания/обновления,
+        # а не только по date (она может совпадать у нескольких тренировок).
+        # PostgREST поддерживает multi-order через запятую.
+        "order": "updated_at.desc,created_at.desc,date.desc",
         "limit": str(limit),
         "offset": str(offset)
     }

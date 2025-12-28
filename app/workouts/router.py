@@ -1,6 +1,6 @@
 import json
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from app.dependencies import get_current_user, get_current_paid_user
 from .schemas import (
     WorkoutCreate,
@@ -291,11 +291,11 @@ async def complete_draft(
 @router.post("/{workout_id}/clone-draft", response_model=WorkoutResponse, status_code=status.HTTP_201_CREATED)
 async def clone_completed_to_draft(
     workout_id: str,
-    data: WorkoutDraftCloneRequest,
+    data: WorkoutDraftCloneRequest | None = Body(default=None),
     user: dict = Depends(get_current_paid_user),
 ):
     """Клонировать completed-тренировку в draft, чтобы пользователь мог заменить/обсудить/выполнить как новую."""
-    draft_date = data.date or datetime.utcnow().date()
+    draft_date = (data.date if data and data.date else datetime.utcnow().date())
     try:
         draft = await clone_completed_workout_to_draft(user, workout_id, draft_date)
     except httpx.HTTPStatusError as e:

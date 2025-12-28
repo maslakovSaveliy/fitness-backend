@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
-from datetime import date, datetime
+import datetime as dt
 
 
 WorkoutStatus = Literal["draft", "completed"]
@@ -28,17 +28,17 @@ class WorkoutBase(BaseModel):
 
 
 class WorkoutCreate(WorkoutBase):
-    date: Optional[date] = None
+    date: Optional[dt.date] = None
 
 
 class WorkoutResponse(WorkoutBase):
     id: str
     user_id: str
-    date: date
+    date: dt.date
     status: Optional[WorkoutStatus] = None
     rating: Optional[int] = None
     comment: Optional[str] = None
-    created_at: Optional[datetime] = None
+    created_at: Optional[dt.datetime] = None
 
 
 class WorkoutDraftCreateRequest(BaseModel):
@@ -46,18 +46,18 @@ class WorkoutDraftCreateRequest(BaseModel):
     muscle_groups: Optional[list[str]] = None
     wellbeing_reason: Optional[str] = None
     mode: Optional[str] = None
-    date: date
+    date: dt.date
 
 
 class WorkoutDraftCompleteRequest(BaseModel):
-    date: date
+    date: dt.date
     details_structured: WorkoutStructured
     calories_burned: Optional[int] = None
     rating: Optional[Literal[1, 2, 3, 4, 5]] = None
 
 
 class WorkoutDraftCloneRequest(BaseModel):
-    date: Optional[date] = None
+    date: Optional[dt.date] = None
 
 
 class WorkoutGenerateRequest(BaseModel):
@@ -102,7 +102,7 @@ class WorkoutStatsResponse(BaseModel):
     total_workouts: int
     month_workouts: int
     average_weekly: float
-    last_workout_date: Optional[date] = None
+    last_workout_date: Optional[dt.date] = None
     current_split: str
     recommended_split: str
 
