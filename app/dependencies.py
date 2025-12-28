@@ -1,3 +1,5 @@
+import asyncio
+from datetime import datetime
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.auth.service import decode_access_token
@@ -35,7 +37,27 @@ async def get_current_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found"
         )
-    
+
+    # 1-в-1 с ботом: mark_active делает update last_active_at асинхронно (не блокируя ответ).
+    telegram_id = user.get("telegram_id")
+    if isinstance(telegram_id, int):
+        now_iso = datetime.utcnow().isoformat()
+
+        async def _update_last_active_at() -> None:
+            try:
+                await supabase_client.update(
+                    "users",
+                    {"telegram_id": f"eq.{telegram_id}"},
+                    {"last_active_at": now_iso},
+                )
+            except Exception:
+                return
+
+        try:
+            asyncio.create_task(_update_last_active_at())
+        except Exception:
+            pass
+
     return user
 
 
@@ -45,8 +67,14 @@ async def get_current_paid_user(
     """
     Зависимость для проверки оплаченной подписки.
     """
-    from datetime import datetime
-    
+    if not user.get("is_paid", False):
+        # В боте доступ блокируется по флагу is_paid, а текст зависит от trial_expired.
+        trial_expired = bool(user.get("trial_expired", False))
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="Trial required" if not trial_expired else "Subscription required"
+        )
+
     paid_until = user.get("paid_until")
     
     if not paid_until:
@@ -68,5 +96,17 @@ async def get_current_paid_user(
             detail="Invalid subscription data"
         )
     
+    return user
+
+
+async def get_current_admin_user(
+    user: dict = Depends(get_current_user)
+) -> dict:
+    role = user.get("role")
+    if role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
     return user
 

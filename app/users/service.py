@@ -46,10 +46,41 @@ async def update_last_active(telegram_id: int) -> None:
         print(f"Error updating last_active: {e}")
 
 
+async def deactivate_expired_subscriptions() -> int:
+    """
+    1-в-1 с bot/db.py:deactivate_expired_subscriptions.
+    Без оплат: просто помечаем is_paid=false для просроченных paid_until.
+    """
+    today = datetime.utcnow().date().isoformat()
+    rows = await supabase_client.get(
+        "users",
+        {
+            "paid_until": f"lt.{today}",
+            "is_paid": "eq.true",
+            "select": "id",
+            "limit": "10000",
+        },
+    )
+    if not rows:
+        return 0
+
+    updated = 0
+    for u in rows:
+        user_id = u.get("id")
+        if not isinstance(user_id, str):
+            continue
+        try:
+            await supabase_client.update("users", {"id": f"eq.{user_id}"}, {"is_paid": False})
+            updated += 1
+        except Exception:
+            continue
+    return updated
+
+
 async def get_user_stats(user_id: str) -> dict:
     all_workouts = await supabase_client.get(
         "workouts",
-        {"user_id": f"eq.{user_id}", "select": "id,date"}
+        {"user_id": f"eq.{user_id}", "status": "eq.completed", "select": "id,date"}
     )
     total_workouts = len(all_workouts) if all_workouts else 0
     
@@ -60,6 +91,7 @@ async def get_user_stats(user_id: str) -> dict:
         "workouts",
         {
             "user_id": f"eq.{user_id}",
+            "status": "eq.completed",
             "date": f"gte.{month_start_iso}",
             "select": "id"
         }
@@ -87,6 +119,7 @@ async def calculate_workout_streak(user_id: str) -> int:
         "workouts",
         {
             "user_id": f"eq.{user_id}",
+            "status": "eq.completed",
             "select": "date",
             "order": "date.desc",
             "limit": "30"

@@ -10,16 +10,23 @@ from .schemas import (
     DailyNutritionStatsResponse,
     NutritionPlanCreate,
     NutritionPlanResponse,
-    KBJURecommendations
+    KBJURecommendations,
+    NutritionPlanMenuResponse,
+    ShoppingListRequest,
+    ShoppingListResponse,
 )
 from .service import (
     get_user_meals,
     create_meal,
     analyze_food_photo,
+    analyze_food_photo_with_history,
     get_daily_nutrition_stats,
     get_active_nutrition_plan,
     create_nutrition_plan,
-    get_kbju_recommendations
+    get_kbju_recommendations,
+    create_daily_menu,
+    get_menu_by_id,
+    generate_shopping_list,
 )
 
 router = APIRouter(prefix="/nutrition", tags=["nutrition"])
@@ -88,7 +95,14 @@ async def analyze_food(
     user: dict = Depends(get_current_paid_user)
 ):
     """Анализировать фото еды через AI."""
-    result = await analyze_food_photo(data.image_url, data.clarification)
+    if data.clarifications:
+        result = await analyze_food_photo_with_history(
+            data.image_url,
+            data.clarifications,
+            initial_description=data.initial_description,
+        )
+    else:
+        result = await analyze_food_photo(data.image_url, data.clarification)
     return result
 
 
@@ -194,4 +208,45 @@ async def create_plan(
         target_carbs=plan.get("target_carbs"),
         created_at=plan.get("created_at")
     )
+
+
+@router.get("/plans/active/menu", response_model=NutritionPlanMenuResponse)
+async def get_active_plan_menu(user: dict = Depends(get_current_paid_user)):
+    """Сгенерировать новый дневной рацион на основе активного плана (как в боте)."""
+    plan = await get_active_nutrition_plan(user["id"])
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active nutrition plan not found")
+
+    menu = await create_daily_menu(user, plan)
+    return NutritionPlanMenuResponse(
+        id=menu["id"],
+        plan_id=menu["plan_id"],
+        date=menu["date"],
+        menu_text=menu["menu_text"],
+        created_at=menu.get("created_at"),
+    )
+
+
+@router.post("/plans/active/shopping-list", response_model=ShoppingListResponse)
+async def get_shopping_list(
+    data: ShoppingListRequest,
+    user: dict = Depends(get_current_paid_user),
+):
+    """Сгенерировать список продуктов по дневному рациону (menu_id или menu_text)."""
+    plan = await get_active_nutrition_plan(user["id"])
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active nutrition plan not found")
+
+    menu_text: str | None = data.menu_text
+    if not menu_text and data.menu_id:
+        menu = await get_menu_by_id(data.menu_id, plan["id"])
+        if not menu:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Menu not found")
+        menu_text = menu.get("menu_text")
+
+    if not menu_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="menu_text or menu_id is required")
+
+    shopping_list = await generate_shopping_list(menu_text)
+    return ShoppingListResponse(shopping_list=shopping_list)
 

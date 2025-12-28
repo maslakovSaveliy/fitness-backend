@@ -32,6 +32,8 @@ class MealListResponse(BaseModel):
 class FoodAnalyzeRequest(BaseModel):
     image_url: str
     clarification: Optional[str] = None
+    clarifications: Optional[list[str]] = None
+    initial_description: Optional[str] = None
 
 
 class FoodAnalyzeResponse(BaseModel):
@@ -88,4 +90,21 @@ class KBJURecommendations(BaseModel):
     remaining_fats: int
     remaining_carbs: int
     recommendations: list[str]
+
+
+class NutritionPlanMenuResponse(BaseModel):
+    id: str
+    plan_id: str
+    date: date
+    menu_text: str
+    created_at: Optional[datetime] = None
+
+
+class ShoppingListRequest(BaseModel):
+    menu_id: Optional[str] = None
+    menu_text: Optional[str] = None
+
+
+class ShoppingListResponse(BaseModel):
+    shopping_list: str
 

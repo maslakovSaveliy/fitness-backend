@@ -89,6 +89,21 @@ async def analyze_food_photo(
     return FoodAnalyzeResponse(description="Не удалось распознать блюдо")
 
 
+async def analyze_food_photo_with_history(
+    image_url: str,
+    clarifications: list[str],
+    initial_description: str | None = None,
+) -> FoodAnalyzeResponse:
+    # 1-в-1 с bot/calories.py:process_calories_clarification
+    initial_desc = (initial_description or "").strip() or "Фото еды"
+    prompt_parts: list[str] = [f'Исходное описание: "{initial_desc}".']
+    for idx, clar in enumerate(clarifications):
+        prompt_parts.append(f'Уточнение {idx + 1}: "{clar}".')
+    prompt_parts.append("Уточни результат, учитывая все детали выше. Верни JSON с описанием, калориями и БЖУ.")
+    combined = "\n".join(prompt_parts)
+    return await analyze_food_photo(image_url, combined)
+
+
 async def get_daily_nutrition_stats(
     user_id: str,
     date_filter: dt_date | None = None
@@ -186,6 +201,31 @@ async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate) -> dict
     
     result = await supabase_client.insert("nutrition_plans", plan_data)
     return result[0] if result else None
+
+
+async def create_daily_menu(user: dict, plan: dict) -> dict:
+    from datetime import date as dt_date_today
+    today = dt_date_today.today()
+    menu_text = await ai_service.generate_daily_menu(user, plan)
+
+    payload = {
+        "plan_id": plan["id"],
+        "date": today.isoformat(),
+        "menu_text": menu_text,
+    }
+    result = await supabase_client.insert("nutrition_plan_menus", payload)
+    return result[0] if result else {"id": "", **payload}
+
+
+async def get_menu_by_id(menu_id: str, plan_id: str) -> dict | None:
+    return await supabase_client.get_one(
+        "nutrition_plan_menus",
+        {"id": f"eq.{menu_id}", "plan_id": f"eq.{plan_id}"},
+    )
+
+
+async def generate_shopping_list(menu_text: str) -> str:
+    return await ai_service.generate_shopping_list(menu_text)
 
 
 def calculate_kbju_targets(user: dict) -> dict:
