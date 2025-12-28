@@ -2,18 +2,28 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
+from app.workouts.schemas import WorkoutResponse
 
 class TrainerChatSessionCreateRequest(BaseModel):
-	original_workout_text: Optional[str] = None
+	workout_id: str
 
 
 class TrainerChatSessionResponse(BaseModel):
 	id: str
 	user_id: str
 	status: str
+	workout_id: Optional[str] = None
 	original_workout_text: Optional[str] = None
 	updated_workout_text: Optional[str] = None
+	original_workout_details: Optional[object] = None
+	updated_workout_details: Optional[object] = None
 	created_at: Optional[datetime] = None
+	updated_at: Optional[datetime] = None
+
+
+class TrainerChatSessionCreateResponse(BaseModel):
+	session: TrainerChatSessionResponse
+	initial_assistant_message: str
 
 
 class TrainerChatMessageCreateRequest(BaseModel):
@@ -33,6 +43,6 @@ class TrainerChatSendMessageResponse(BaseModel):
 
 
 class TrainerChatFinishResponse(BaseModel):
-	updated_workout_text: str
+	workout: WorkoutResponse
 
 

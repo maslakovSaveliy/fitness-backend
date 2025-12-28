@@ -46,6 +46,64 @@ async def get_user_workouts(
     return workouts, total
 
 
+def _infer_target_muscle_group_from_details(details_value: object) -> str | None:
+    if not isinstance(details_value, dict):
+        return None
+    try:
+        structured = WorkoutStructured.model_validate(details_value)
+        if structured.muscle_groups:
+            return ", ".join(structured.muscle_groups[:2])
+    except Exception:
+        return None
+    return None
+
+
+async def clone_completed_workout_to_draft(
+    user: dict,
+    workout_id: str,
+    draft_date: dt_date,
+) -> dict | None:
+    source = await supabase_client.get_one(
+        "workouts",
+        {"id": f"eq.{workout_id}", "user_id": f"eq.{user['id']}", "status": "eq.completed"},
+    )
+    if not source:
+        return None
+
+    details_value = source.get("details")
+    source_ctx = source.get("generation_context") if isinstance(source.get("generation_context"), dict) else None
+    target_muscle_group = None
+    if source_ctx and isinstance(source_ctx.get("target_muscle_group"), str):
+        tmg = source_ctx.get("target_muscle_group")
+        if tmg and tmg.strip():
+            target_muscle_group = tmg.strip()
+    if not target_muscle_group:
+        target_muscle_group = _infer_target_muscle_group_from_details(details_value)
+
+    generation_context: dict[str, object] = {
+        "mode": "clone_last",
+        "cloned_from_workout_id": source.get("id"),
+    }
+    if source_ctx:
+        generation_context.update(source_ctx)
+    if target_muscle_group:
+        generation_context["target_muscle_group"] = target_muscle_group
+
+    draft_data: dict[str, object] = {
+        "id": str(uuid4()),
+        "user_id": user["id"],
+        "date": draft_date.isoformat(),
+        "workout_type": source.get("workout_type") or "ai",
+        "details": details_value,
+        "status": "draft",
+        "generation_context": generation_context,
+        "calories_burned": source.get("calories_burned"),
+    }
+
+    created = await supabase_client.insert("workouts", draft_data)
+    return created[0] if created else None
+
+
 async def create_workout(user_id: str, data: WorkoutCreate) -> dict:
     workout_date = data.date or dt_date.today()
     

@@ -16,6 +16,7 @@ from .schemas import (
 	ManualWorkoutAnalyzeResponse,
     WorkoutDraftCreateRequest,
     WorkoutDraftCompleteRequest,
+    WorkoutDraftCloneRequest,
 )
 from .service import (
     get_user_workouts,
@@ -25,6 +26,7 @@ from .service import (
     replace_workout_draft,
     replace_workout_exercise,
     complete_workout_draft,
+    clone_completed_workout_to_draft,
     generate_workout,
     rate_workout,
     get_workout_stats,
@@ -283,6 +285,43 @@ async def complete_draft(
         rating=updated.get("rating"),
         comment=updated.get("comment"),
         created_at=updated.get("created_at"),
+    )
+
+
+@router.post("/{workout_id}/clone-draft", response_model=WorkoutResponse, status_code=status.HTTP_201_CREATED)
+async def clone_completed_to_draft(
+    workout_id: str,
+    data: WorkoutDraftCloneRequest,
+    user: dict = Depends(get_current_paid_user),
+):
+    """Клонировать completed-тренировку в draft, чтобы пользователь мог заменить/обсудить/выполнить как новую."""
+    draft_date = data.date or datetime.utcnow().date()
+    try:
+        draft = await clone_completed_workout_to_draft(user, workout_id, draft_date)
+    except httpx.HTTPStatusError as e:
+        detail: object
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+    if not draft:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workout not found")
+
+    details_text, details_structured = _details_to_response_fields(draft.get("details"))
+    return WorkoutResponse(
+        id=draft["id"],
+        user_id=draft["user_id"],
+        date=draft["date"],
+        workout_type=draft["workout_type"],
+        details=details_text,
+        details_structured=details_structured,
+        calories_burned=draft.get("calories_burned"),
+        status=draft.get("status"),
+        rating=draft.get("rating"),
+        comment=draft.get("comment"),
+        created_at=draft.get("created_at"),
     )
 
 

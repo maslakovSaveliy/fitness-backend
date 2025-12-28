@@ -1,8 +1,10 @@
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from app.dependencies import get_current_user, get_current_paid_user
 from .schemas import (
 	TrainerChatSessionCreateRequest,
 	TrainerChatSessionResponse,
+	TrainerChatSessionCreateResponse,
 	TrainerChatMessageCreateRequest,
 	TrainerChatSendMessageResponse,
 	TrainerChatFinishResponse,
@@ -18,15 +20,34 @@ from .service import (
 router = APIRouter(prefix="/trainer-chat", tags=["trainer-chat"])
 
 
-@router.post("/sessions", response_model=TrainerChatSessionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/sessions", response_model=TrainerChatSessionCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_trainer_chat_session(
 	data: TrainerChatSessionCreateRequest,
 	user: dict = Depends(get_current_paid_user),
 ):
-	session = await create_session(user, data.original_workout_text)
-	if not session:
+	try:
+		session, initial_message = await create_session(user, data.workout_id)
+	except httpx.HTTPStatusError as e:
+		# Частый кейс: таблицы trainer_chat_* не созданы в Supabase (миграции не применены) → 404 от PostgREST.
+		detail: object
+		try:
+			detail = e.response.json()
+		except Exception:
+			detail = e.response.text
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail={
+				"error": "supabase_request_failed",
+				"hint": "Проверь, что применены scripts/supabase/001_trainer_chat.sql и 007_trainer_chat_workout_link.sql в Supabase SQL Editor",
+				"supabase": detail,
+			},
+		)
+	if not session or not initial_message:
 		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to create session")
-	return TrainerChatSessionResponse(**session)
+	return TrainerChatSessionCreateResponse(
+		session=TrainerChatSessionResponse(**session),
+		initial_assistant_message=initial_message,
+	)
 
 
 @router.post("/sessions/{session_id}/messages", response_model=TrainerChatSendMessageResponse)
@@ -52,8 +73,10 @@ async def finish_session(
 	if not session:
 		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-	updated = await finish_trainer_chat(session, user)
-	return TrainerChatFinishResponse(updated_workout_text=updated)
+	workout = await finish_trainer_chat(session, user)
+	if not workout:
+		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to update workout")
+	return TrainerChatFinishResponse(workout=workout)
 
 
 @router.post("/sessions/{session_id}/revert", response_model=TrainerChatFinishResponse)
@@ -65,8 +88,10 @@ async def revert_session(
 	if not session:
 		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-	original = await revert_trainer_chat(session, user)
-	return TrainerChatFinishResponse(updated_workout_text=original)
+	workout = await revert_trainer_chat(session, user)
+	if not workout:
+		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to revert workout")
+	return TrainerChatFinishResponse(workout=workout)
 
 
 @router.get("/sessions/{session_id}", response_model=TrainerChatSessionResponse)

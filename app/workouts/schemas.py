@@ -56,6 +56,10 @@ class WorkoutDraftCompleteRequest(BaseModel):
     rating: Optional[Literal[1, 2, 3, 4, 5]] = None
 
 
+class WorkoutDraftCloneRequest(BaseModel):
+    date: Optional[date] = None
+
+
 class WorkoutGenerateRequest(BaseModel):
     muscle_group: Optional[str] = None
     muscle_groups: Optional[list[str]] = None
