@@ -89,6 +89,32 @@ def build_workout_structured_prompt(
     workout_history_info: str,
     exercises_info: str,
 ) -> str:
+    def _parse_selected_groups(value: str) -> list[str]:
+        parts = [p.strip() for p in value.split(",")]
+        return [p for p in parts if p]
+
+    selected_groups = _parse_selected_groups(muscle_group)
+    is_multi_group = len(selected_groups) > 1
+    selected_groups_text = ", ".join(selected_groups) if selected_groups else muscle_group
+
+    muscle_groups_constraints = (
+        f"- muscle_groups: 2–4 группы мышц (из списка: {selected_groups_text}), без добавления других"
+        if is_multi_group
+        else f"- muscle_groups: 1–2 группы мышц, соответствующие дню тренировки: {selected_groups_text}"
+    )
+
+    balance_rule = (
+        f"- Сбалансируй упражнения между выбранными группами мышц: {selected_groups_text}"
+        if is_multi_group
+        else ""
+    )
+
+    allowed_rule = (
+        f"- Не добавляй упражнения на другие группы мышц, кроме: {selected_groups_text}"
+        if is_multi_group
+        else f"- Не добавляй упражнения на другие группы мышц, кроме {selected_groups_text}"
+    )
+
     # ВАЖНО: Фронт ожидает структуру 1-в-1 под UI (мышцы + упражнения с вес/подходы/повторы).
     # Просим AI вернуть только JSON, чтобы не было мусора вокруг.
     return f"""Ты профессиональный фитнес-тренер. Составь тренировку СТРОГО в формате JSON (без Markdown, без пояснений).
@@ -122,7 +148,7 @@ def build_workout_structured_prompt(
 }}
 
 ОГРАНИЧЕНИЯ:
-- muscle_groups: 1–2 группы мышц, соответствующие дню тренировки: {muscle_group}
+{muscle_groups_constraints}
 - exercises: 5–8 упражнений
 - sets: 2–6
 - reps: одно из значений: 5, 8, 10, 12, 15
@@ -130,7 +156,8 @@ def build_workout_structured_prompt(
 - calories_burned: целое число, оценка сожженных калорий за тренировку
 
 ПРАВИЛА:
-- Не добавляй упражнения на другие группы мышц, кроме {muscle_group}
+{allowed_rule}
+{balance_rule}
 - Учитывай оборудование и ограничения
 - Избегай повторов из последних тренировок, если возможно
 - Возвращай ТОЛЬКО JSON (одна строка или много строк — не важно)"""
