@@ -19,6 +19,7 @@ from .schemas import (
     WorkoutStructuredExercise,
     WorkoutDraftCreateRequest,
     WorkoutDraftCompleteRequest,
+    ManualWorkoutLogRequest,
 )
 from app.users.service import calculate_workout_streak
 
@@ -150,20 +151,30 @@ async def create_workout_draft(user: dict, data: WorkoutDraftCreateRequest) -> d
     if not selected_muscle_groups and data.muscle_group:
         selected_muscle_groups = [data.muscle_group]
 
+    is_wellbeing_mode = data.mode == "wellbeing" and isinstance(data.wellbeing_reason, str) and data.wellbeing_reason.strip()
+
     target = ", ".join(selected_muscle_groups) if selected_muscle_groups else None
     used_muscle_group = target or await get_next_muscle_group_for_user(user)
 
-    # 1-в-1 с ботом: last_muscle_group обновляется ДО генерации.
-    if selected_muscle_groups and isinstance(selected_muscle_groups[0], str):
-        await _update_last_muscle_group(user["id"], selected_muscle_groups[0])
-    else:
-        await _update_last_muscle_group(user["id"], used_muscle_group)
+    # В wellbeing-режиме AI сам выбирает группы мышц — last_muscle_group обновляем ПОСЛЕ генерации.
+    if not is_wellbeing_mode:
+        # 1-в-1 с ботом: last_muscle_group обновляется ДО генерации.
+        if selected_muscle_groups and isinstance(selected_muscle_groups[0], str):
+            await _update_last_muscle_group(user["id"], selected_muscle_groups[0])
+        else:
+            await _update_last_muscle_group(user["id"], used_muscle_group)
 
-    workout_structured_raw = await ai_service.generate_workout_structured(
-        user,
-        target_muscle_group=used_muscle_group,
-        wellbeing_reason=data.wellbeing_reason,
-    )
+    if is_wellbeing_mode:
+        workout_structured_raw = await ai_service.generate_wellbeing_workout_structured(
+            user=user,
+            wellbeing_reason=data.wellbeing_reason.strip(),
+        )
+    else:
+        workout_structured_raw = await ai_service.generate_workout_structured(
+            user,
+            target_muscle_group=used_muscle_group,
+            wellbeing_reason=data.wellbeing_reason,
+        )
     calories_raw = workout_structured_raw.get("calories_burned")
     calories_burned: int | None = None
     if isinstance(calories_raw, int) and calories_raw > 0:
@@ -178,6 +189,9 @@ async def create_workout_draft(user: dict, data: WorkoutDraftCreateRequest) -> d
 
     workout_structured = WorkoutStructured.model_validate(workout_structured_raw)
 
+    if is_wellbeing_mode and workout_structured.muscle_groups:
+        await _update_last_muscle_group(user["id"], workout_structured.muscle_groups[0])
+
     workout_data = {
         "id": str(uuid4()),
         "user_id": user["id"],
@@ -187,7 +201,7 @@ async def create_workout_draft(user: dict, data: WorkoutDraftCreateRequest) -> d
         "status": "draft",
         "generation_context": {
             "muscle_groups": selected_muscle_groups,
-            "target_muscle_group": used_muscle_group,
+            "target_muscle_group": ", ".join(workout_structured.muscle_groups) if is_wellbeing_mode else used_muscle_group,
             "wellbeing_reason": data.wellbeing_reason,
             "mode": data.mode,
         },
@@ -234,6 +248,13 @@ async def replace_workout_draft(user: dict, workout_id: str) -> dict | None:
     wellbeing_reason = ctx.get("wellbeing_reason")
     if not isinstance(wellbeing_reason, str):
         wellbeing_reason = None
+    if isinstance(wellbeing_reason, str):
+        wellbeing_reason = wellbeing_reason.strip() or None
+
+    mode = ctx.get("mode")
+    if not isinstance(mode, str):
+        mode = None
+    is_wellbeing_mode = mode == "wellbeing" and wellbeing_reason is not None
 
     # Для случайной AI-тренировки (без выбранных мышц и без wellbeing) при "Заменить"
     # должны меняться группы мышц по ротации (как в боте).
@@ -243,7 +264,26 @@ async def replace_workout_draft(user: dict, workout_id: str) -> dict | None:
         and wellbeing_reason is None
     )
 
-    if is_random_ai:
+    if is_wellbeing_mode:
+        avoid_exercise_names: list[str] | None = None
+        try:
+            current_details = workout.get("details")
+            if isinstance(current_details, dict):
+                current_structured = WorkoutStructured.model_validate(current_details)
+                avoid_exercise_names = [ex.name for ex in current_structured.exercises if ex.name]
+        except Exception:
+            avoid_exercise_names = None
+
+        workout_structured_raw = await ai_service.generate_wellbeing_workout_structured(
+            user=user,
+            wellbeing_reason=wellbeing_reason,
+            avoid_exercise_names=avoid_exercise_names,
+        )
+        workout_structured = WorkoutStructured.model_validate(workout_structured_raw)
+        if workout_structured.muscle_groups:
+            await _update_last_muscle_group(user["id"], workout_structured.muscle_groups[0])
+        target = ", ".join(workout_structured.muscle_groups) if workout_structured.muscle_groups else None
+    elif is_random_ai:
         used_muscle_group = await get_next_muscle_group_for_user(user)
         await _update_last_muscle_group(user["id"], used_muscle_group)
         target = used_muscle_group
@@ -251,12 +291,12 @@ async def replace_workout_draft(user: dict, workout_id: str) -> dict | None:
         target = target_muscle_group or (
             ", ".join(selected_muscle_groups) if selected_muscle_groups else None
         )
-
-    workout_structured_raw = await ai_service.generate_workout_structured(
-        user,
-        target_muscle_group=target or WorkoutStructured.model_validate(workout.get("details")).muscle_groups[0],
-        wellbeing_reason=wellbeing_reason,
-    )
+        workout_structured_raw = await ai_service.generate_workout_structured(
+            user,
+            target_muscle_group=target or WorkoutStructured.model_validate(workout.get("details")).muscle_groups[0],
+            wellbeing_reason=wellbeing_reason,
+        )
+        workout_structured = WorkoutStructured.model_validate(workout_structured_raw)
 
     calories_raw = workout_structured_raw.get("calories_burned")
     calories_burned: int | None = None
@@ -265,7 +305,6 @@ async def replace_workout_draft(user: dict, workout_id: str) -> dict | None:
     if isinstance(calories_raw, float):
         calories_burned = int(calories_raw)
 
-    workout_structured = WorkoutStructured.model_validate(workout_structured_raw)
     update_data: dict[str, object] = {
         "details": workout_structured.model_dump(),
         "updated_at": datetime.utcnow().isoformat(),
@@ -273,7 +312,7 @@ async def replace_workout_draft(user: dict, workout_id: str) -> dict | None:
     if calories_burned is not None:
         update_data["calories_burned"] = calories_burned
 
-    if is_random_ai:
+    if is_random_ai or is_wellbeing_mode:
         existing_ctx = ctx if isinstance(ctx, dict) else {}
         update_data["generation_context"] = {
             **existing_ctx,
@@ -502,6 +541,108 @@ async def analyze_manual_workout(user: dict, description: str) -> dict:
     }
 
 
+def _normalize_manual_log_exercise_name(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
+def _to_int(value: object, default_value: int = 0) -> int:
+    if isinstance(value, bool):
+        return default_value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except Exception:
+            return default_value
+    return default_value
+
+
+async def log_manual_workout(user: dict, data: ManualWorkoutLogRequest) -> dict | None:
+    # 1) Фильтруем и нормализуем упражнения (пустые названия выкидываем).
+    cleaned: list[WorkoutStructuredExercise] = []
+    for ex in data.exercises:
+        name = _normalize_manual_log_exercise_name(ex.name)
+        if not name:
+            continue
+
+        weight_kg = max(0, _to_int(ex.weight_kg, 0))
+        sets = max(0, _to_int(ex.sets, 0))
+        reps = max(0, _to_int(ex.reps, 0))
+
+        # Для structured схемы мы храним числа, но UI уже умеет не показывать селекты если 0.
+        cleaned.append(
+            WorkoutStructuredExercise(
+                name=name,
+                weight_kg=weight_kg,
+                sets=sets,
+                reps=reps,
+            )
+        )
+
+    if not cleaned:
+        return None
+
+    # 2) AI-метаданные (title, muscle_groups, calories_burned)
+    exercises_for_ai: list[dict[str, object]] = [
+        {
+            "name": ex.name,
+            "weight_kg": ex.weight_kg,
+            "sets": ex.sets,
+            "reps": ex.reps,
+        }
+        for ex in cleaned
+    ]
+
+    meta_raw = await ai_service.infer_manual_workout_metadata(user=user, exercises=exercises_for_ai)
+    title_value = meta_raw.get("title")
+    muscle_groups_value = meta_raw.get("muscle_groups")
+    calories_value = meta_raw.get("calories_burned")
+
+    title = str(title_value).strip() if isinstance(title_value, (str, int, float)) else "Записанная тренировка"
+    if not title:
+        title = "Записанная тренировка"
+    if len(title) > 120:
+        title = title[:120]
+
+    muscle_groups: list[str] = []
+    if isinstance(muscle_groups_value, list):
+        for item in muscle_groups_value[:4]:
+            if isinstance(item, str) and item.strip():
+                muscle_groups.append(item.strip())
+    if not muscle_groups:
+        muscle_groups = ["Общий комплекс"]
+
+    calories_burned: int | None = None
+    if isinstance(calories_value, (int, float, str)):
+        try:
+            calories_burned = int(float(calories_value))
+        except Exception:
+            calories_burned = None
+    if calories_burned is not None and calories_burned <= 0:
+        calories_burned = None
+
+    # 3) Собираем structured workout и сохраняем как completed manual
+    structured = WorkoutStructured(
+        version=1,
+        title=title,
+        muscle_groups=muscle_groups,
+        exercises=cleaned,
+    )
+
+    workout_create = WorkoutCreate(
+        workout_type="manual",
+        details=_format_workout_text(structured),
+        details_structured=structured,
+        calories_burned=calories_burned,
+        date=data.date,
+    )
+
+    return await create_workout(user["id"], workout_create)
+
+
 async def rate_workout(workout_id: str, data: WorkoutRateRequest) -> dict:
     update_data = {"rating": data.rating}
     if data.comment:
@@ -626,4 +767,23 @@ async def get_workout_by_id(workout_id: str, user_id: str) -> dict | None:
         {"id": f"eq.{workout_id}", "user_id": f"eq.{user_id}"}
     )
     return workout
+
+
+async def get_workouts_in_range(
+    user_id: str,
+    start_iso: str,
+    end_iso: str,
+    limit: int = 500,
+) -> list[dict]:
+    # end_iso не включительно
+    params: dict[str, str] = {
+        "user_id": f"eq.{user_id}",
+        "status": "eq.completed",
+        "order": "updated_at.desc,created_at.desc,date.desc",
+        "limit": str(limit),
+        # PostgREST: несколько условий на одно поле делаем через and
+        "and": f"(date.gte.{start_iso},date.lt.{end_iso})",
+    }
+    workouts = await supabase_client.get("workouts", params)
+    return workouts or []
 

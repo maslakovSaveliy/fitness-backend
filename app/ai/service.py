@@ -12,6 +12,8 @@ from .prompts import (
     build_workout_prompt,
     build_workout_structured_prompt,
     build_workout_single_exercise_prompt,
+    build_manual_workout_infer_prompt,
+    build_wellbeing_workout_structured_prompt,
     FOOD_ANALYSIS_PROMPT,
     FOOD_CLARIFICATION_PROMPT,
     DAILY_MENU_SYSTEM_PROMPT,
@@ -210,6 +212,126 @@ class AIService:
 
         normalized = self._normalize_structured_workout(parsed, fallback_muscle_group=chosen_group)
         return normalized
+
+    async def generate_wellbeing_workout_structured(
+        self,
+        user: dict,
+        wellbeing_reason: str,
+        avoid_exercise_names: list[str] | None = None,
+    ) -> dict:
+        if not settings.openai_api_key:
+            logger.error("openai_api_key_is_missing")
+            raise RuntimeError("OpenAI API key is missing")
+
+        attendance_data = await self._calculate_attendance(user["id"])
+        real_frequency = attendance_data["real_frequency"]
+        recommended_split = attendance_data["recommended_split"]
+
+        use_supersets = self._should_use_supersets(user)
+
+        custom_frequency = user.get("custom_split_frequency")
+        if custom_frequency is not None:
+            display_frequency = custom_frequency
+            display_split = WORKOUT_SPLITS.get(custom_frequency, recommended_split)
+        else:
+            display_frequency = real_frequency
+            display_split = recommended_split
+
+        # Фоллбек-группа нужна только для нормализации, если AI вернёт пусто/мусор.
+        fallback_group = random.choice(display_split) if display_split else "общий комплекс"
+
+        split_description = SPLIT_DESCRIPTIONS.get(display_frequency, SPLIT_DESCRIPTIONS[3])
+        split_type = "выбранный" if custom_frequency is not None else "рекомендованный"
+        split_info = (
+            f"ВАЖНО: Тренировка адаптирована под {split_type} сплит пользователя. "
+            f"Пользователь тренируется примерно {display_frequency} раз в неделю. "
+            f"{split_type.title()} сплит: {split_description}."
+        )
+
+        if use_supersets:
+            superset_info = (
+                "Пользователь предпочитает интенсивные форматы тренировок. "
+                "Суперсеты допустимы, но используй их осторожно с учётом самочувствия."
+            )
+        else:
+            superset_info = (
+                "ВАЖНО: Пользователь отключил суперсеты. НЕ используй суперсеты. "
+                "Каждое упражнение должно быть отдельным."
+            )
+
+        workout_history_info, exercises_info = await self._get_workout_history_info(user["id"])
+
+        prompt = build_wellbeing_workout_structured_prompt(
+            user=user,
+            wellbeing_reason=wellbeing_reason,
+            avoid_exercise_names=avoid_exercise_names,
+            split_info=split_info,
+            superset_info=superset_info,
+            workout_history_info=workout_history_info,
+            exercises_info=exercises_info,
+        )
+
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            max_tokens=1100,
+            response_format={"type": "json_object"},
+        )
+
+        raw = (response.choices[0].message.content or "").strip()
+        parsed = self._extract_json_object(raw)
+        if not parsed:
+            raise RuntimeError("AI returned invalid JSON for wellbeing workout")
+
+        normalized = self._normalize_structured_workout(parsed, fallback_muscle_group=fallback_group)
+        return normalized
+
+    async def infer_manual_workout_metadata(
+        self,
+        user: dict,
+        exercises: list[dict[str, object]],
+    ) -> dict[str, object]:
+        if not settings.openai_api_key:
+            logger.error("openai_api_key_is_missing")
+            raise RuntimeError("OpenAI API key is missing")
+
+        prompt = build_manual_workout_infer_prompt(user=user, exercises=exercises)
+
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=350,
+                response_format={"type": "json_object"},
+            )
+        except TypeError:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=350,
+            )
+
+        raw = (response.choices[0].message.content or "").strip()
+        parsed = self._extract_json_object(raw)
+        if not parsed:
+            raise RuntimeError("AI returned invalid JSON for manual workout inference")
+
+        if not isinstance(parsed, dict):
+            raise RuntimeError("AI returned invalid object for manual workout inference")
+
+        return parsed
 
     async def generate_workout_exercise(
         self,

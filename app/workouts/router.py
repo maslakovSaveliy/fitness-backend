@@ -1,4 +1,5 @@
 import json
+import datetime as dt
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from app.dependencies import get_current_user, get_current_paid_user
@@ -14,6 +15,7 @@ from .schemas import (
 	NextMuscleGroupResponse,
 	ManualWorkoutAnalyzeRequest,
 	ManualWorkoutAnalyzeResponse,
+    ManualWorkoutLogRequest,
     WorkoutDraftCreateRequest,
     WorkoutDraftCompleteRequest,
     WorkoutDraftCloneRequest,
@@ -21,6 +23,7 @@ from .schemas import (
 from .service import (
     get_user_workouts,
     create_workout,
+    log_manual_workout,
     create_workout_draft,
     delete_workout_draft,
     replace_workout_draft,
@@ -35,6 +38,7 @@ from .service import (
 	get_next_muscle_group_for_user,
 	analyze_manual_workout,
 	get_workout_dates,
+    get_workouts_in_range,
 )
 
 router = APIRouter(prefix="/workouts", tags=["workouts"])
@@ -379,6 +383,82 @@ async def analyze_manual_workout_endpoint(
     """Проанализировать описание ручной тренировки (улучшить текст, оценить калории, дать совет)."""
     result = await analyze_manual_workout(user, data.description)
     return ManualWorkoutAnalyzeResponse(**result)
+
+
+@router.post("/manual/log", response_model=WorkoutResponse, status_code=status.HTTP_201_CREATED)
+async def log_manual_workout_endpoint(
+    data: ManualWorkoutLogRequest,
+    user: dict = Depends(get_current_paid_user),
+):
+    """Записать тренировку из списка упражнений (structured), сохранить как completed manual."""
+    try:
+        workout = await log_manual_workout(user, data)
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        detail: object
+        try:
+            detail = e.response.json()
+        except Exception:
+            detail = e.response.text
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+    if not workout:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No exercises to log")
+
+    details_text, details_structured = _details_to_response_fields(workout.get("details"))
+    return WorkoutResponse(
+        id=workout["id"],
+        user_id=workout["user_id"],
+        date=workout["date"],
+        workout_type=workout["workout_type"],
+        details=details_text,
+        details_structured=details_structured,
+        calories_burned=workout.get("calories_burned"),
+        status=workout.get("status"),
+        rating=workout.get("rating"),
+        comment=workout.get("comment"),
+        created_at=workout.get("created_at"),
+    )
+
+
+@router.get("/week", response_model=list[WorkoutResponse])
+async def list_workouts_week(
+    start: str = Query(..., description="YYYY-MM-DD (inclusive)"),
+    end: str = Query(..., description="YYYY-MM-DD (exclusive)"),
+    user: dict = Depends(get_current_user),
+):
+    """Получить тренировки пользователя за диапазон дат (для недели)."""
+    try:
+        # Валидация ISO-дат
+        start_date = dt.date.fromisoformat(start)
+        end_date = dt.date.fromisoformat(end)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date format")
+
+    if end_date <= start_date:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date range")
+
+    workouts = await get_workouts_in_range(user["id"], start_date.isoformat(), end_date.isoformat())
+    items: list[WorkoutResponse] = []
+    for w in workouts:
+        details_text, details_structured = _details_to_response_fields(w.get("details"))
+        items.append(
+            WorkoutResponse(
+                id=w["id"],
+                user_id=w["user_id"],
+                date=w["date"],
+                workout_type=w["workout_type"],
+                details=details_text,
+                details_structured=details_structured,
+                calories_burned=w.get("calories_burned"),
+                status=w.get("status"),
+                rating=w.get("rating"),
+                comment=w.get("comment"),
+                created_at=w.get("created_at"),
+            )
+        )
+    return items
 
 
 @router.post("/{workout_id}/rate", response_model=WorkoutResponse)

@@ -9,8 +9,9 @@ WorkoutStatus = Literal["draft", "completed"]
 class WorkoutStructuredExercise(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     weight_kg: int = Field(ge=0, le=500)
-    sets: int = Field(ge=1, le=20)
-    reps: int = Field(ge=1, le=200)
+    # 0 означает “не задано” (например, пользователь не указывает повторы/подходы).
+    sets: int = Field(ge=0, le=20)
+    reps: int = Field(ge=0, le=200)
 
 
 class WorkoutStructured(BaseModel):
@@ -95,6 +96,19 @@ class ManualWorkoutAnalyzeResponse(BaseModel):
     improved_description: str
     calories_burned: Optional[int] = None
     post_workout_advice: str
+
+
+class ManualWorkoutLogExercise(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    # 0 значит параметр не указан пользователем (в UI селект "0 ...").
+    weight_kg: int = Field(ge=0, le=500, default=0)
+    sets: int = Field(ge=0, le=20, default=0)
+    reps: int = Field(ge=0, le=200, default=0)
+
+
+class ManualWorkoutLogRequest(BaseModel):
+    exercises: list[ManualWorkoutLogExercise] = Field(min_length=1, max_length=50)
+    date: Optional[dt.date] = None
 
 
 class WorkoutStatsResponse(BaseModel):
