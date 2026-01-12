@@ -1,0 +1,59 @@
+Всегда отвечай на русском языке. Пиши прямо, по делу.
+
+Проект: fitness-backend (FastAPI backend для Telegram Mini App)
+
+## Цели и ограничения
+- Не используй any/unknown/never и избегай type assertions без необходимости.
+- Не дублируй код. Не оставляй неиспользуемые импорты/переменные.
+- Следуй модульной структуре: каждый домен = `router.py` + `schemas.py` + `service.py`.
+- Сохраняй совместимость с существующей схемой Supabase: `workouts.details` может быть `jsonb` (структура) или legacy строка.
+
+## Стек и архитектура
+- FastAPI + Pydantic v2.
+- Supabase через PostgREST (httpx) — используем `app/db/client.py` (`SupabaseClient`), без ORM.
+- JWT auth: `/auth/telegram` валидирует Telegram WebApp `initData` и выдаёт JWT.
+- Зависимости:
+  - `get_current_user` для обычных эндпоинтов
+  - `get_current_paid_user` для платных фич (возвращает 402 при отсутствии/истечении подписки)
+  - `get_current_admin_user` для админских эндпоинтов (role=admin)
+
+## Правила разработки эндпоинтов
+- Новую фичу добавляй как модуль `app/<domain>/{__init__.py,router.py,schemas.py,service.py}` и подключай router в `app/main.py`.
+- В `router.py`:
+  - делай валидацию входных данных через Pydantic схемы
+  - ошибки отдавай через `HTTPException` с корректным статусом (400/401/402/403/404/500/502)
+  - не делай сложной бизнес-логики — выноси в `service.py`
+- В `service.py`:
+  - работай с Supabase только через `supabase_client`
+  - используй PostgREST фильтры (`eq.`, `lt.`, `gte.`, `and=(...)`), как уже сделано в workouts/nutrition
+  - не делай запросы “в лоб” без лимитов: ставь `limit` и/или пагинацию
+
+## Данные и совместимость (важно)
+- `workouts.details`:
+  - при записи: если есть structured объект — сохраняем dict в jsonb, иначе строку (jsonb-строка)
+  - при чтении: для UI отдаём `details` (строка) и `details_structured` (объект или null), используя существующую логику преобразования.
+- Draft/completed:
+  - draft создаётся через `/workouts/drafts`, редактируется replace/replace-exercise и trainer-chat, и становится completed через `/workouts/{id}/complete`.
+- Любые изменения схемы Supabase описывай SQL-скриптами в `scripts/supabase/*.sql` (их применяют вручную).
+
+## AI
+- Используй `app/ai/service.py` как единую точку работы с OpenAI.
+- Для structured output предпочитай JSON-ответ и нормализацию (как `_normalize_structured_workout`).
+- При недоступном ключе OpenAI возвращай понятную ошибку (обычно RuntimeError → 502 в роутере).
+
+## Админка и Telegram
+- Админские эндпоинты живут в `app/admin/*` и `app/broadcast/*` и защищены `get_current_admin_user`.
+- Отправка сообщений в TG: через `app/telegram/service.py` (`telegram_service`) с throttling.
+
+## Качество кода
+- Декомпозируй: функции/файлы не раздувать (если > 400 строк — выноси в подмодули).
+- Магические числа выноси в константы (особенно лимиты, интервалы, таймауты).
+- Минимум комментариев — только там, где логика неочевидна.
+
+## Локальная разработка (твои команды)
+- Запуск API:
+  - `./venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8075 --reload`
+- Туннель для бэка:
+  - `cloudflared tunnel --protocol http2 --config ~/.cloudflared/config.yml run krugi-local`
+
+
