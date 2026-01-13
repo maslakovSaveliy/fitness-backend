@@ -56,4 +56,24 @@
 - Туннель для бэка:
   - `cloudflared tunnel --protocol http2 --config ~/.cloudflared/config.yml run krugi-local`
 
+## Продакшен (сервер)
+- **URL**: `https://api.f1tnes2-b0t.online`
+- **Путь**: `/root/fitness-backend`
+- **Обновление версии**:
+  ```bash
+  cd /root/fitness-backend
+  git pull
+  systemctl restart fitness-backend
+  systemctl status fitness-backend
+  ```
+- **Проверка статуса**:
+  ```bash
+  systemctl status fitness-backend cloudflared-backend
+  journalctl -u fitness-backend -n 50 --no-pager
+  curl http://localhost:8075/health
+  curl https://api.f1tnes2-b0t.online/health
+  ```
+- **Настройки**: `.env` файл в `/root/fitness-backend/.env` (SUPABASE_URL, JWT_SECRET, OPENAI_API_KEY, TELEGRAM_BOT_TOKEN)
+- **Туннели**: управляются через systemd (`fitness-backend.service`, `cloudflared-backend.service`)
+
 
