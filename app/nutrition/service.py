@@ -34,12 +34,20 @@ async def get_user_meals(
 
 
 async def create_meal(user_id: str, data: MealCreate) -> dict:
-    meal_date = data.date or dt_date.today()
+    # Parse date from string or use today
+    if data.date:
+        if isinstance(data.date, str):
+            meal_date = dt_date.fromisoformat(data.date)
+        else:
+            meal_date = data.date
+    else:
+        meal_date = dt_date.today()
     
     meal_data = {
         "user_id": user_id,
         "date": meal_date.isoformat(),
         "description": data.description,
+        "meal_type": data.meal_type or "user",  # Default to "user" for manual entries
     }
     
     if data.calories is not None:
@@ -104,20 +112,37 @@ async def analyze_food_photo_with_history(
     return await analyze_food_photo(image_url, combined)
 
 
+async def analyze_food_description(description: str) -> FoodAnalyzeResponse:
+    """Analyze food from text description only (no photo)."""
+    response = await ai_service.analyze_food_description(description)
+    
+    json_start = response.find('{')
+    json_end = response.rfind('}')
+    
+    if json_start != -1 and json_end != -1 and json_end > json_start:
+        try:
+            data = json.loads(response[json_start:json_end+1])
+            return FoodAnalyzeResponse(
+                description=data.get("description", description),
+                calories=data.get("calories"),
+                proteins=data.get("proteins"),
+                fats=data.get("fats"),
+                carbs=data.get("carbs")
+            )
+        except json.JSONDecodeError:
+            pass
+    
+    return FoodAnalyzeResponse(description=description)
+
+
 async def get_daily_nutrition_stats(
     user_id: str,
     date_filter: dt_date | None = None
 ) -> dict:
+    """Get nutrition stats for a specific date. Always calculates from actual meals."""
     target_date = date_filter or dt_date.today()
     
-    stats = await supabase_client.get_one(
-        "daily_nutrition_stats",
-        {"user_id": f"eq.{user_id}", "date": f"eq.{target_date.isoformat()}"}
-    )
-    
-    if stats:
-        return stats
-    
+    # Always calculate from meals table to ensure accuracy
     return await update_daily_nutrition_stats(user_id, target_date)
 
 
@@ -182,12 +207,16 @@ async def get_active_nutrition_plan(user_id: str) -> dict | None:
     )
 
 
-async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate) -> dict:
+async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate, user: dict) -> dict:
+    """Create nutrition plan with calculated KBJU targets based on user data and nutrition goal."""
     await supabase_client.update(
         "nutrition_plans",
         {"user_id": f"eq.{user_id}", "is_active": "eq.true"},
         {"is_active": False}
     )
+    
+    # Calculate KBJU targets based on user profile AND nutrition goal from brief
+    targets = calculate_kbju_targets(user, data.nutrition_goal)
     
     plan_data = {
         "user_id": user_id,
@@ -196,7 +225,11 @@ async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate) -> dict
         "meal_preferences": data.meal_preferences,
         "cooking_time": data.cooking_time,
         "budget": data.budget,
-        "is_active": True
+        "is_active": True,
+        "target_calories": targets["target_calories"],
+        "target_proteins": targets["target_proteins"],
+        "target_fats": targets["target_fats"],
+        "target_carbs": targets["target_carbs"],
     }
     
     result = await supabase_client.insert("nutrition_plans", plan_data)
@@ -204,6 +237,7 @@ async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate) -> dict
 
 
 async def create_daily_menu(user: dict, plan: dict) -> dict:
+    """Legacy function for text-based menu generation."""
     from datetime import date as dt_date_today
     today = dt_date_today.today()
     menu_text = await ai_service.generate_daily_menu(user, plan)
@@ -217,6 +251,102 @@ async def create_daily_menu(user: dict, plan: dict) -> dict:
     return result[0] if result else {"id": "", **payload}
 
 
+async def create_weekly_menu(user: dict, plan: dict) -> list[dict]:
+    """Generate and save structured JSON menu for 7 days."""
+    weekly_menus = await ai_service.generate_weekly_menu_structured(user, plan)
+    
+    results: list[dict] = []
+    for day_menu in weekly_menus:
+        day_of_week = day_menu.get("day_of_week", 0)
+        
+        payload = {
+            "plan_id": plan["id"],
+            "day_of_week": day_of_week,
+            "menu_text": "",
+            "menu_structured": json.dumps(day_menu),
+        }
+        
+        try:
+            result = await supabase_client.insert("nutrition_plan_menus", payload)
+            if result:
+                menu_record = result[0]
+                menu_record["menu_structured"] = day_menu
+                results.append(menu_record)
+            else:
+                results.append({"id": "", **payload, "menu_structured": day_menu})
+        except Exception:
+            results.append({"id": "", **payload, "menu_structured": day_menu})
+    
+    return results
+
+
+async def get_menu_by_day_of_week(plan_id: str, day_of_week: int) -> dict | None:
+    """Get menu for specific day of week (0=Monday, 6=Sunday)."""
+    try:
+        menu = await supabase_client.get_one(
+            "nutrition_plan_menus",
+            {
+                "plan_id": f"eq.{plan_id}",
+                "day_of_week": f"eq.{day_of_week}",
+                "order": "created_at.desc",
+                "limit": "1",
+            }
+        )
+    except Exception:
+        return None
+    
+    if menu and menu.get("menu_structured"):
+        if isinstance(menu["menu_structured"], str):
+            try:
+                menu["menu_structured"] = json.loads(menu["menu_structured"])
+            except json.JSONDecodeError:
+                menu["menu_structured"] = None
+    
+    return menu
+
+
+async def get_week_menus(plan_id: str) -> list[dict]:
+    """Get all 7 day menus for the plan."""
+    try:
+        menus = await supabase_client.get(
+            "nutrition_plan_menus",
+            {
+                "plan_id": f"eq.{plan_id}",
+                "order": "day_of_week.asc",
+            }
+        )
+    except Exception:
+        return []
+    
+    result: list[dict] = []
+    for menu in menus:
+        if menu.get("menu_structured"):
+            if isinstance(menu["menu_structured"], str):
+                try:
+                    menu["menu_structured"] = json.loads(menu["menu_structured"])
+                except json.JSONDecodeError:
+                    menu["menu_structured"] = None
+        result.append(menu)
+    
+    return result
+
+
+async def has_week_menu(plan_id: str) -> bool:
+    """Check if weekly menu exists for the plan."""
+    try:
+        menus = await supabase_client.get(
+            "nutrition_plan_menus",
+            {
+                "plan_id": f"eq.{plan_id}",
+                "select": "id",
+                "limit": "1",
+            }
+        )
+        return len(menus) > 0
+    except Exception:
+        return False
+
+
 async def get_menu_by_id(menu_id: str, plan_id: str) -> dict | None:
     return await supabase_client.get_one(
         "nutrition_plan_menus",
@@ -228,7 +358,15 @@ async def generate_shopping_list(menu_text: str) -> str:
     return await ai_service.generate_shopping_list(menu_text)
 
 
-def calculate_kbju_targets(user: dict) -> dict:
+def calculate_kbju_targets(user: dict, nutrition_goal: str | None = None) -> dict:
+    """
+    Calculate KBJU targets based on user data and nutrition goal.
+    
+    Args:
+        user: User profile data (weight, height, age, gender, workouts_per_week)
+        nutrition_goal: Goal from nutrition plan brief (e.g. "Похудеть", "Набрать массу")
+                       Takes priority over user.goal if provided
+    """
     try:
         weight = float(user.get('weight') or 70)
         height = float(user.get('height') or 175)
@@ -258,15 +396,21 @@ def calculate_kbju_targets(user: dict) -> dict:
         activity_multiplier = 1.725
     
     tdee = bmr * activity_multiplier
-    goal = (user.get('goal') or '').lower()
     
-    if 'похудеть' in goal or 'сбросить' in goal or 'снижение' in goal:
+    # Use nutrition_goal from plan if provided, otherwise fall back to user.goal
+    goal = (nutrition_goal or user.get('goal') or '').lower()
+    
+    if 'похудеть' in goal or 'сбросить' in goal or 'снижение' in goal or 'похудение' in goal:
         target_calories = tdee - 500
         protein_percent, fat_percent, carb_percent = 35, 25, 40
-    elif 'набрать' in goal or 'массу' in goal or 'набор' in goal:
+    elif 'набрать' in goal or 'массу' in goal or 'набор' in goal or 'масса' in goal:
         target_calories = tdee + 300
         protein_percent, fat_percent, carb_percent = 30, 20, 50
+    elif 'поддерж' in goal or 'форм' in goal:
+        target_calories = tdee
+        protein_percent, fat_percent, carb_percent = 30, 25, 45
     else:
+        # Default: slight deficit for general health
         target_calories = tdee - 200
         protein_percent, fat_percent, carb_percent = 30, 25, 45
     
@@ -278,8 +422,25 @@ def calculate_kbju_targets(user: dict) -> dict:
     }
 
 
-async def get_kbju_recommendations(user: dict, daily_stats: dict) -> dict:
-    targets = calculate_kbju_targets(user)
+async def get_kbju_recommendations(user: dict, daily_stats: dict, plan: dict | None = None) -> dict:
+    """
+    Get KBJU recommendations for today.
+    
+    Uses targets from active nutrition plan if available,
+    otherwise calculates from user profile.
+    """
+    # Use targets from plan if available, otherwise calculate
+    if plan and plan.get('target_calories'):
+        targets = {
+            'target_calories': plan['target_calories'],
+            'target_proteins': plan.get('target_proteins', 100),
+            'target_fats': plan.get('target_fats', 70),
+            'target_carbs': plan.get('target_carbs', 250),
+        }
+    else:
+        # Calculate from user profile with nutrition_goal if plan exists
+        nutrition_goal = plan.get('nutrition_goal') if plan else None
+        targets = calculate_kbju_targets(user, nutrition_goal)
     
     current_calories = daily_stats.get('total_calories', 0) or 0
     current_proteins = daily_stats.get('total_proteins', 0) or 0

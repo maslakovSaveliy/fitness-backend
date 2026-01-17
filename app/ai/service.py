@@ -19,6 +19,8 @@ from .prompts import (
     DAILY_MENU_SYSTEM_PROMPT,
     SHOPPING_LIST_SYSTEM_PROMPT,
     build_daily_menu_prompt,
+    build_daily_menu_structured_prompt,
+    build_weekly_menu_structured_prompt,
     build_shopping_list_prompt,
 )
 
@@ -601,7 +603,51 @@ class AIService:
             raise RuntimeError("AI returned empty food analysis")
         return result
 
+    async def analyze_food_description(self, description: str) -> str:
+        """Analyze food from text description only (no photo)."""
+        if not settings.openai_api_key:
+            logger.error("openai_api_key_is_missing")
+            raise RuntimeError("OpenAI API key is missing")
+
+        system_prompt = """Ты эксперт по питанию. Пользователь описывает еду текстом.
+Оцени калорийность и БЖУ на основе описания.
+
+ВСЕГДА возвращай ответ в формате JSON:
+{
+  "description": "уточненное описание блюда",
+  "calories": число (ккал),
+  "proteins": число (г),
+  "fats": число (г),
+  "carbs": число (г)
+}
+
+Если описание слишком общее, сделай разумные предположения о порции (средняя порция).
+Возвращай ТОЛЬКО JSON, без markdown и пояснений."""
+
+        logger.info(
+            "ai_analyze_food_description_request",
+            extra={"description_len": len(description)},
+        )
+        
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": description},
+            ],
+            temperature=0.3,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+        )
+        
+        result = (response.choices[0].message.content or "").strip()
+        if not result:
+            logger.error("ai_analyze_food_description_empty_response")
+            raise RuntimeError("AI returned empty food analysis")
+        return result
+
     async def generate_daily_menu(self, user: dict, nutrition_plan: dict) -> str:
+        """Legacy method for text-based menu generation."""
         if not settings.openai_api_key:
             logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
@@ -622,6 +668,241 @@ class AIService:
         if not menu_text:
             raise RuntimeError("AI returned empty daily menu")
         return menu_text
+
+    async def generate_daily_menu_structured(self, user: dict, nutrition_plan: dict) -> dict:
+        """Generate structured JSON menu for the day."""
+        if not settings.openai_api_key:
+            logger.error("openai_api_key_is_missing")
+            raise RuntimeError("OpenAI API key is missing")
+
+        prompt = build_daily_menu_structured_prompt(user, nutrition_plan)
+        logger.info("ai_generate_daily_menu_structured_request", extra={"user_id": user.get("id")})
+
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.8,
+                max_tokens=2000,
+                response_format={"type": "json_object"},
+            )
+        except TypeError:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.8,
+                max_tokens=2000,
+            )
+
+        raw = (response.choices[0].message.content or "").strip()
+        if not raw:
+            raise RuntimeError("AI returned empty daily menu")
+
+        parsed = self._extract_json_object(raw)
+        if not parsed:
+            logger.error(
+                "ai_generate_daily_menu_structured_parse_failed",
+                extra={"user_id": user.get("id"), "raw_preview": raw[:300]},
+            )
+            raise RuntimeError("AI returned invalid JSON for daily menu")
+
+        return self._normalize_daily_menu(parsed, nutrition_plan)
+
+    def _normalize_daily_menu(self, raw: dict, nutrition_plan: dict) -> dict:
+        """Normalize and validate the AI-generated menu structure."""
+        target_calories = raw.get("target_calories") or nutrition_plan.get("target_calories") or 2000
+        target_proteins = raw.get("target_proteins") or nutrition_plan.get("target_proteins") or 100
+        target_fats = raw.get("target_fats") or nutrition_plan.get("target_fats") or 70
+        target_carbs = raw.get("target_carbs") or nutrition_plan.get("target_carbs") or 250
+
+        sections_raw = raw.get("sections", [])
+        if not isinstance(sections_raw, list):
+            sections_raw = []
+
+        valid_types = {"breakfast", "lunch", "dinner", "snacks"}
+        default_titles = {
+            "breakfast": "Завтрак",
+            "lunch": "Обед",
+            "dinner": "Ужин",
+            "snacks": "Перекусы",
+        }
+        default_time_ranges = {
+            "breakfast": "7:00-9:00",
+            "lunch": "12:00-14:00",
+            "dinner": "18:00-20:00",
+            "snacks": "В течение дня",
+        }
+
+        sections: list[dict] = []
+        for section_raw in sections_raw:
+            if not isinstance(section_raw, dict):
+                continue
+
+            section_type = section_raw.get("type", "")
+            if section_type not in valid_types:
+                continue
+
+            title = section_raw.get("title") or default_titles.get(section_type, "")
+            time_range = section_raw.get("time_range") or default_time_ranges.get(section_type, "")
+
+            items_raw = section_raw.get("items", [])
+            if not isinstance(items_raw, list):
+                items_raw = []
+
+            items: list[dict] = []
+            for item_raw in items_raw[:5]:
+                if not isinstance(item_raw, dict):
+                    continue
+
+                name = item_raw.get("name", "")
+                if not name or not isinstance(name, str):
+                    continue
+
+                calories = item_raw.get("calories", 0)
+                proteins = item_raw.get("proteins", 0)
+                fats = item_raw.get("fats", 0)
+                carbs = item_raw.get("carbs", 0)
+
+                items.append({
+                    "name": str(name).strip(),
+                    "calories": int(calories) if isinstance(calories, (int, float)) else 0,
+                    "proteins": int(proteins) if isinstance(proteins, (int, float)) else 0,
+                    "fats": int(fats) if isinstance(fats, (int, float)) else 0,
+                    "carbs": int(carbs) if isinstance(carbs, (int, float)) else 0,
+                })
+
+            if items:
+                sections.append({
+                    "type": section_type,
+                    "title": str(title).strip(),
+                    "time_range": str(time_range).strip(),
+                    "items": items,
+                })
+
+        tip_of_day = raw.get("tip_of_day", "")
+        if not isinstance(tip_of_day, str):
+            tip_of_day = "Пейте достаточно воды в течение дня."
+
+        return {
+            "target_calories": int(target_calories),
+            "target_proteins": int(target_proteins),
+            "target_fats": int(target_fats),
+            "target_carbs": int(target_carbs),
+            "sections": sections,
+            "tip_of_day": str(tip_of_day).strip() or "Пейте достаточно воды в течение дня.",
+        }
+
+    async def generate_weekly_menu_structured(self, user: dict, nutrition_plan: dict) -> list[dict]:
+        """Generate structured JSON menu for 7 days (week)."""
+        if not settings.openai_api_key:
+            logger.error("openai_api_key_is_missing")
+            raise RuntimeError("OpenAI API key is missing")
+
+        prompt = build_weekly_menu_structured_prompt(user, nutrition_plan)
+        logger.info("ai_generate_weekly_menu_structured_request", extra={"user_id": user.get("id")})
+
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.8,
+                max_tokens=8000,
+                response_format={"type": "json_object"},
+            )
+        except TypeError:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.8,
+                max_tokens=8000,
+            )
+
+        raw = (response.choices[0].message.content or "").strip()
+        if not raw:
+            raise RuntimeError("AI returned empty weekly menu")
+
+        parsed = self._extract_json_array_or_object(raw)
+        if not parsed:
+            logger.error(
+                "ai_generate_weekly_menu_structured_parse_failed",
+                extra={"user_id": user.get("id"), "raw_preview": raw[:500]},
+            )
+            raise RuntimeError("AI returned invalid JSON for weekly menu")
+
+        return self._normalize_weekly_menu(parsed, nutrition_plan)
+
+    def _extract_json_array_or_object(self, raw: str) -> list | dict | None:
+        """Extract JSON array or object from raw response."""
+        # Try array first
+        array_start = raw.find("[")
+        array_end = raw.rfind("]")
+        if array_start != -1 and array_end != -1 and array_end > array_start:
+            try:
+                return json.loads(raw[array_start : array_end + 1])
+            except Exception:
+                pass
+        
+        # Fall back to object (might contain array inside)
+        obj_start = raw.find("{")
+        obj_end = raw.rfind("}")
+        if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+            try:
+                result = json.loads(raw[obj_start : obj_end + 1])
+                # If object contains "days" or "week" array, extract it
+                if isinstance(result, dict):
+                    for key in ["days", "week", "menus", "menu"]:
+                        if key in result and isinstance(result[key], list):
+                            return result[key]
+                return result
+            except Exception:
+                pass
+        return None
+
+    def _normalize_weekly_menu(self, parsed: list | dict, nutrition_plan: dict) -> list[dict]:
+        """Normalize weekly menu to list of 7 day menus."""
+        day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+        
+        # Convert to list if needed
+        if isinstance(parsed, dict):
+            # Single day - wrap in list
+            parsed = [parsed]
+        
+        if not isinstance(parsed, list):
+            raise RuntimeError("Weekly menu must be a list")
+
+        result: list[dict] = []
+        for i in range(7):
+            if i < len(parsed) and isinstance(parsed[i], dict):
+                day_menu = self._normalize_daily_menu(parsed[i], nutrition_plan)
+                day_menu["day_of_week"] = i
+                day_menu["day_name"] = day_names[i]
+            else:
+                # Generate empty placeholder for missing day
+                day_menu = {
+                    "day_of_week": i,
+                    "day_name": day_names[i],
+                    "target_calories": nutrition_plan.get("target_calories", 2000),
+                    "target_proteins": nutrition_plan.get("target_proteins", 100),
+                    "target_fats": nutrition_plan.get("target_fats", 70),
+                    "target_carbs": nutrition_plan.get("target_carbs", 250),
+                    "sections": [],
+                    "tip_of_day": "Пейте достаточно воды в течение дня.",
+                }
+            result.append(day_menu)
+
+        return result
 
     async def generate_shopping_list(self, daily_menu: str) -> str:
         if not settings.openai_api_key:

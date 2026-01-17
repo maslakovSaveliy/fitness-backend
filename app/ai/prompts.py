@@ -371,12 +371,200 @@ FOOD_CLARIFICATION_PROMPT = """Пользователь прислал фото 
 Отвечай всегда только на русском языке."""
 
 
-DAILY_MENU_SYSTEM_PROMPT = "Ты профессиональный диетолог. Создаёшь разнообразные рационы на день. Отвечай всегда только на русском языке."
+DAILY_MENU_SYSTEM_PROMPT = "Ты профессиональный диетолог. Создаёшь разнообразные рационы на день. Возвращай только JSON."
+
+DAILY_MENU_SYSTEM_PROMPT_LEGACY = "Ты профессиональный диетолог. Создаёшь разнообразные рационы на день. Отвечай всегда только на русском языке."
 
 SHOPPING_LIST_SYSTEM_PROMPT = "Ты помощник по составлению списков продуктов. Отвечай всегда только на русском языке."
 
 
+def build_daily_menu_structured_prompt(user: dict, nutrition_plan: dict, day_name: str = "") -> str:
+	"""Build prompt for structured JSON menu generation for a single day."""
+	user_info = f"""
+Физические данные:
+- Пол: {user.get('gender', 'не указан')}
+- Возраст: {user.get('age', 'не указан')}
+- Рост: {user.get('height', 'не указан')} см
+- Вес: {user.get('weight', 'не указан')} кг
+- Цель фитнеса: {user.get('goal', 'не указана')}
+- Уровень активности: {user.get('level', 'не указан')}
+- Частота тренировок: {user.get('workouts_per_week', 'не указана')} раз в неделю
+
+Параметры плана питания:
+- Цель питания: {nutrition_plan.get('nutrition_goal', '')}
+- Ограничения: {nutrition_plan.get('dietary_restrictions', '')}
+- Предпочтения: {nutrition_plan.get('meal_preferences', '')}
+- Время на готовку: {nutrition_plan.get('cooking_time', '')}
+- Бюджет: {nutrition_plan.get('budget', '')}
+""".strip()
+
+	target_calories = nutrition_plan.get('target_calories', 2000)
+	target_proteins = nutrition_plan.get('target_proteins', 100)
+	target_fats = nutrition_plan.get('target_fats', 70)
+	target_carbs = nutrition_plan.get('target_carbs', 250)
+	
+	day_context = f"Это рацион на {day_name}. " if day_name else ""
+
+	return f"""
+Создай разнообразный рацион на день для пользователя. {day_context}
+
+{user_info}
+
+Целевые показатели на день:
+- Калории: {target_calories} ккал
+- Белки: {target_proteins} г
+- Жиры: {target_fats} г
+- Углеводы: {target_carbs} г
+
+Верни JSON строго в следующем формате:
+{{
+  "target_calories": {target_calories},
+  "target_proteins": {target_proteins},
+  "target_fats": {target_fats},
+  "target_carbs": {target_carbs},
+  "sections": [
+    {{
+      "type": "breakfast",
+      "title": "Завтрак",
+      "time_range": "7:00-9:00",
+      "items": [
+        {{"name": "Название блюда", "calories": 350, "proteins": 15, "fats": 10, "carbs": 45}}
+      ]
+    }},
+    {{
+      "type": "lunch",
+      "title": "Обед",
+      "time_range": "12:00-14:00",
+      "items": [
+        {{"name": "Название блюда", "calories": 500, "proteins": 30, "fats": 15, "carbs": 60}}
+      ]
+    }},
+    {{
+      "type": "dinner",
+      "title": "Ужин",
+      "time_range": "18:00-20:00",
+      "items": [
+        {{"name": "Название блюда", "calories": 400, "proteins": 25, "fats": 12, "carbs": 40}}
+      ]
+    }},
+    {{
+      "type": "snacks",
+      "title": "Перекусы",
+      "time_range": "В течение дня",
+      "items": [
+        {{"name": "Название перекуса", "calories": 150, "proteins": 5, "fats": 3, "carbs": 20}}
+      ]
+    }}
+  ],
+  "tip_of_day": "Практичный совет по питанию"
+}}
+
+ВАЖНО:
+1. Создай УНИКАЛЬНЫЕ блюда для этого дня
+2. Учитывай все ограничения и предпочтения пользователя
+3. Подбери блюда под бюджет и время готовки
+4. Сумма калорий всех блюд должна приближаться к целевому значению
+5. Блюда должны быть реалистичными и выполнимыми
+6. В каждой секции должно быть 1-3 блюда
+7. Названия блюд на русском языке
+8. Возвращай ТОЛЬКО JSON, без markdown и пояснений
+""".strip()
+
+
+def build_weekly_menu_structured_prompt(user: dict, nutrition_plan: dict) -> str:
+	"""Build prompt for structured JSON menu generation for 7 days."""
+	user_info = f"""
+Физические данные:
+- Пол: {user.get('gender', 'не указан')}
+- Возраст: {user.get('age', 'не указан')}
+- Рост: {user.get('height', 'не указан')} см
+- Вес: {user.get('weight', 'не указан')} кг
+- Цель фитнеса: {user.get('goal', 'не указана')}
+- Уровень активности: {user.get('level', 'не указан')}
+- Частота тренировок: {user.get('workouts_per_week', 'не указана')} раз в неделю
+
+Параметры плана питания:
+- Цель питания: {nutrition_plan.get('nutrition_goal', '')}
+- Ограничения: {nutrition_plan.get('dietary_restrictions', '')}
+- Предпочтения: {nutrition_plan.get('meal_preferences', '')}
+- Время на готовку: {nutrition_plan.get('cooking_time', '')}
+- Бюджет: {nutrition_plan.get('budget', '')}
+""".strip()
+
+	target_calories = nutrition_plan.get('target_calories', 2000)
+	target_proteins = nutrition_plan.get('target_proteins', 100)
+	target_fats = nutrition_plan.get('target_fats', 70)
+	target_carbs = nutrition_plan.get('target_carbs', 250)
+
+	return f"""
+Создай разнообразное меню на НЕДЕЛЮ (7 дней) для пользователя.
+
+{user_info}
+
+Целевые показатели НА КАЖДЫЙ ДЕНЬ:
+- Калории: {target_calories} ккал
+- Белки: {target_proteins} г
+- Жиры: {target_fats} г
+- Углеводы: {target_carbs} г
+
+Верни JSON массив из 7 объектов (понедельник-воскресенье):
+[
+  {{
+    "day_of_week": 0,
+    "day_name": "Понедельник",
+    "sections": [
+      {{
+        "type": "breakfast",
+        "title": "Завтрак",
+        "time_range": "7:00-9:00",
+        "items": [{{"name": "Блюдо", "calories": 350, "proteins": 15, "fats": 10, "carbs": 45}}]
+      }},
+      {{
+        "type": "lunch",
+        "title": "Обед",
+        "time_range": "12:00-14:00",
+        "items": [{{"name": "Блюдо", "calories": 500, "proteins": 30, "fats": 15, "carbs": 60}}]
+      }},
+      {{
+        "type": "dinner",
+        "title": "Ужин",
+        "time_range": "18:00-20:00",
+        "items": [{{"name": "Блюдо", "calories": 400, "proteins": 25, "fats": 12, "carbs": 40}}]
+      }},
+      {{
+        "type": "snacks",
+        "title": "Перекусы",
+        "time_range": "В течение дня",
+        "items": [{{"name": "Перекус", "calories": 150, "proteins": 5, "fats": 3, "carbs": 20}}]
+      }}
+    ],
+    "tip_of_day": "Совет дня"
+  }},
+  ... // еще 6 дней (вторник=1, среда=2, четверг=3, пятница=4, суббота=5, воскресенье=6)
+]
+
+КРИТИЧЕСКИ ВАЖНО - ТОЧНОЕ СООТВЕТСТВИЕ КБЖУ:
+1. Сумма калорий всех блюд за день ДОЛЖНА ТОЧНО равняться {target_calories} ккал (±50 ккал)
+2. Сумма белков ДОЛЖНА ТОЧНО равняться {target_proteins} г (±5 г)
+3. Сумма жиров ДОЛЖНА ТОЧНО равняться {target_fats} г (±5 г)
+4. Сумма углеводов ДОЛЖНА ТОЧНО равняться {target_carbs} г (±10 г)
+5. Рассчитай КБЖУ каждого блюда так, чтобы при суммировании получились целевые значения
+
+ДОПОЛНИТЕЛЬНЫЕ ТРЕБОВАНИЯ:
+6. Создай УНИКАЛЬНЫЕ блюда на каждый день - НЕ повторяй одинаковые блюда
+7. Учитывай все ограничения и предпочтения пользователя
+8. Подбери блюда под бюджет и время готовки
+9. В каждой секции должно быть 1-3 блюда
+10. Названия блюд на русском языке
+11. Возвращай ТОЛЬКО JSON массив, без markdown и пояснений
+
+ПРОВЕРКА: Перед ответом убедись, что сумма calories/proteins/fats/carbs за каждый день соответствует целевым!
+8. day_of_week: 0=понедельник, 1=вторник, ..., 6=воскресенье
+""".strip()
+
+
 def build_daily_menu_prompt(user: dict, nutrition_plan: dict) -> str:
+	"""Legacy prompt for text-based menu generation."""
 	user_info = f"""
 Физические данные:
 - Пол: {user.get('gender', 'не указан')}

@@ -1,17 +1,21 @@
 from datetime import date
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from app.dependencies import get_current_user, get_current_paid_user
 from .schemas import (
     MealCreate,
     MealResponse,
     MealListResponse,
     FoodAnalyzeRequest,
+    FoodDescriptionRequest,
     FoodAnalyzeResponse,
     DailyNutritionStatsResponse,
     NutritionPlanCreate,
     NutritionPlanResponse,
     KBJURecommendations,
     NutritionPlanMenuResponse,
+    DailyMenuStructured,
+    DailyMenuStructuredResponse,
+    WeekMenuResponse,
     ShoppingListRequest,
     ShoppingListResponse,
 )
@@ -20,11 +24,16 @@ from .service import (
     create_meal,
     analyze_food_photo,
     analyze_food_photo_with_history,
+    analyze_food_description,
     get_daily_nutrition_stats,
     get_active_nutrition_plan,
     create_nutrition_plan,
     get_kbju_recommendations,
     create_daily_menu,
+    create_weekly_menu,
+    get_menu_by_day_of_week,
+    get_week_menus,
+    has_week_menu,
     get_menu_by_id,
     generate_shopping_list,
 )
@@ -53,6 +62,7 @@ async def list_meals(
             fats=m.get("fats"),
             carbs=m.get("carbs"),
             photo_url=m.get("photo_url"),
+            meal_type=m.get("meal_type", "snack"),
             created_at=m.get("created_at")
         )
         for m in meals
@@ -61,12 +71,14 @@ async def list_meals(
     return MealListResponse(items=items, total=total)
 
 
-@router.post("/meals", response_model=MealResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/meals", status_code=status.HTTP_201_CREATED)
 async def add_meal(
     data: MealCreate,
     user: dict = Depends(get_current_paid_user)
 ):
     """Добавить прием пищи."""
+    import logging
+    logging.info(f"Creating meal: {data}")
     meal = await create_meal(user["id"], data)
     
     if not meal:
@@ -75,18 +87,20 @@ async def add_meal(
             detail="Failed to create meal"
         )
     
-    return MealResponse(
-        id=meal["id"],
-        user_id=meal["user_id"],
-        date=meal["date"],
-        description=meal["description"],
-        calories=meal.get("calories"),
-        proteins=meal.get("proteins"),
-        fats=meal.get("fats"),
-        carbs=meal.get("carbs"),
-        photo_url=meal.get("photo_url"),
-        created_at=meal.get("created_at")
-    )
+    # Return raw dict - skip Pydantic response validation
+    return {
+        "id": meal["id"],
+        "user_id": meal["user_id"],
+        "date": meal["date"],
+        "description": meal["description"],
+        "calories": meal.get("calories"),
+        "proteins": meal.get("proteins"),
+        "fats": meal.get("fats"),
+        "carbs": meal.get("carbs"),
+        "photo_url": meal.get("photo_url"),
+        "meal_type": meal.get("meal_type", "snack"),
+        "created_at": meal.get("created_at")
+    }
 
 
 @router.post("/meals/analyze", response_model=FoodAnalyzeResponse)
@@ -103,6 +117,16 @@ async def analyze_food(
         )
     else:
         result = await analyze_food_photo(data.image_url, data.clarification)
+    return result
+
+
+@router.post("/meals/analyze-description", response_model=FoodAnalyzeResponse)
+async def analyze_food_description_endpoint(
+    data: FoodDescriptionRequest,
+    user: dict = Depends(get_current_paid_user)
+):
+    """Анализировать описание еды через AI (без фото)."""
+    result = await analyze_food_description(data.description)
     return result
 
 
@@ -144,12 +168,15 @@ async def get_date_stats(
 
 @router.get("/recommendations", response_model=KBJURecommendations)
 async def get_recommendations(user: dict = Depends(get_current_user)):
-    """Получить рекомендации по КБЖУ на сегодня."""
+    """Получить рекомендации по КБЖУ на сегодня. Использует targets из активного плана если есть."""
     from datetime import date as dt_date
     today = dt_date.today()
     
     stats = await get_daily_nutrition_stats(user["id"], today)
-    recommendations = await get_kbju_recommendations(user, stats)
+    
+    # Get active plan to use its targets if available
+    plan = await get_active_nutrition_plan(user["id"])
+    recommendations = await get_kbju_recommendations(user, stats, plan)
     
     return KBJURecommendations(**recommendations)
 
@@ -184,14 +211,22 @@ async def create_plan(
     data: NutritionPlanCreate,
     user: dict = Depends(get_current_paid_user)
 ):
-    """Создать новый план питания."""
-    plan = await create_nutrition_plan(user["id"], data)
+    """Создать новый план питания и сгенерировать недельное меню."""
+    plan = await create_nutrition_plan(user["id"], data, user)
     
     if not plan:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create nutrition plan"
         )
+    
+    # Автоматически генерируем недельное меню для нового плана
+    try:
+        await create_weekly_menu(user, plan)
+    except Exception as e:
+        # Логируем ошибку но не прерываем создание плана
+        import logging
+        logging.error(f"Failed to generate weekly menu: {e}")
     
     return NutritionPlanResponse(
         id=plan["id"],
@@ -212,7 +247,7 @@ async def create_plan(
 
 @router.get("/plans/active/menu", response_model=NutritionPlanMenuResponse)
 async def get_active_plan_menu(user: dict = Depends(get_current_paid_user)):
-    """Сгенерировать новый дневной рацион на основе активного плана (как в боте)."""
+    """Legacy: Сгенерировать новый дневной рацион на основе активного плана (текстовый формат)."""
     plan = await get_active_nutrition_plan(user["id"])
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active nutrition plan not found")
@@ -224,6 +259,88 @@ async def get_active_plan_menu(user: dict = Depends(get_current_paid_user)):
         date=menu["date"],
         menu_text=menu["menu_text"],
         created_at=menu.get("created_at"),
+    )
+
+
+@router.get("/plans/active/menu/week", response_model=WeekMenuResponse)
+async def get_week_menu_endpoint(user: dict = Depends(get_current_paid_user)):
+    """Получить недельное меню для активного плана."""
+    plan = await get_active_nutrition_plan(user["id"])
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active nutrition plan not found")
+
+    menus = await get_week_menus(plan["id"])
+    
+    days: list[DailyMenuStructuredResponse | None] = [None] * 7
+    for menu in menus:
+        day_of_week = menu.get("day_of_week")
+        if day_of_week is not None and 0 <= day_of_week < 7 and menu.get("menu_structured"):
+            days[day_of_week] = DailyMenuStructuredResponse(
+                id=menu["id"],
+                plan_id=menu["plan_id"],
+                day_of_week=day_of_week,
+                menu_structured=DailyMenuStructured(**menu["menu_structured"]),
+                created_at=menu.get("created_at"),
+            )
+    
+    return WeekMenuResponse(
+        plan_id=plan["id"],
+        days=days,
+        has_menu=any(d is not None for d in days),
+    )
+
+
+@router.get("/plans/active/menu/day/{day_of_week}", response_model=DailyMenuStructuredResponse | None)
+async def get_day_menu_endpoint(
+    day_of_week: int = Path(..., ge=0, le=6, description="День недели (0=Пн, 6=Вс)"),
+    user: dict = Depends(get_current_paid_user),
+):
+    """Получить меню на конкретный день недели."""
+    plan = await get_active_nutrition_plan(user["id"])
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active nutrition plan not found")
+
+    menu = await get_menu_by_day_of_week(plan["id"], day_of_week)
+    if not menu or not menu.get("menu_structured"):
+        return None
+
+    return DailyMenuStructuredResponse(
+        id=menu["id"],
+        plan_id=menu["plan_id"],
+        day_of_week=menu.get("day_of_week"),
+        menu_structured=DailyMenuStructured(**menu["menu_structured"]),
+        created_at=menu.get("created_at"),
+    )
+
+
+@router.post("/plans/active/menu/generate-week", response_model=WeekMenuResponse, status_code=status.HTTP_201_CREATED)
+async def generate_week_menu_endpoint(user: dict = Depends(get_current_paid_user)):
+    """Сгенерировать недельное меню и сохранить."""
+    plan = await get_active_nutrition_plan(user["id"])
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active nutrition plan not found")
+
+    try:
+        menus = await create_weekly_menu(user, plan)
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+    days: list[DailyMenuStructuredResponse | None] = [None] * 7
+    for menu in menus:
+        day_of_week = menu.get("day_of_week")
+        if day_of_week is not None and 0 <= day_of_week < 7 and menu.get("menu_structured"):
+            days[day_of_week] = DailyMenuStructuredResponse(
+                id=menu["id"],
+                plan_id=menu["plan_id"],
+                day_of_week=day_of_week,
+                menu_structured=DailyMenuStructured(**menu["menu_structured"]),
+                created_at=menu.get("created_at"),
+            )
+
+    return WeekMenuResponse(
+        plan_id=plan["id"],
+        days=days,
+        has_menu=True,
     )
 
 

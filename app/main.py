@@ -1,6 +1,8 @@
 import logging
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from app.config import get_settings
 from app.auth import auth_router
 from app.users import users_router
@@ -38,6 +40,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logging.error(f"Validation error for {request.method} {request.url}: {exc.errors()}")
+    logging.error(f"Request body: {exc.body}")
+    # Convert errors to JSON-serializable format
+    errors = []
+    for err in exc.errors():
+        err_copy = dict(err)
+        if 'input' in err_copy:
+            err_copy['input'] = str(err_copy['input'])
+        errors.append(err_copy)
+    return JSONResponse(
+        status_code=422,
+        content={"detail": errors, "body": str(exc.body)[:500]}
+    )
+
 
 app.include_router(auth_router)
 app.include_router(users_router)
