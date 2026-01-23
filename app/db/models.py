@@ -42,6 +42,7 @@ class UserSubscription(BaseModel):
 class User(UserBase, UserProfile, UserSettings, UserSubscription):
     id: str
     role: Optional[str] = None
+    has_profile: bool = False
     last_active_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
 

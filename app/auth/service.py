@@ -1,6 +1,7 @@
 import hmac
 import hashlib
 import json
+import logging
 from urllib.parse import parse_qs, unquote
 from datetime import datetime, timedelta
 from typing import Optional
@@ -9,6 +10,7 @@ from app.config import get_settings
 from app.db import supabase_client
 from .schemas import TelegramUser
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -88,14 +90,18 @@ async def get_or_create_user(tg_user: TelegramUser) -> dict:
     """
     Получает пользователя из БД или создает нового.
     """
+    logger.info(f"[get_or_create_user] Looking for user with telegram_id={tg_user.id}")
+    
     user = await supabase_client.get_one(
         "users",
         {"telegram_id": f"eq.{tg_user.id}"}
     )
     
     if user:
+        logger.info(f"[get_or_create_user] User found: id={user.get('id')}, has_profile={user.get('has_profile')}")
         return user
     
+    logger.info(f"[get_or_create_user] User not found, creating new user")
     new_user = {
         "telegram_id": tg_user.id,
         "username": tg_user.username,
@@ -103,11 +109,19 @@ async def get_or_create_user(tg_user: TelegramUser) -> dict:
         "last_name": tg_user.last_name,
         "is_paid": False,
         "is_pro": False,
-        "trial_expired": False
+        "trial_expired": False,
+        "has_profile": False,
     }
     
-    result = await supabase_client.insert("users", new_user)
-    return result[0] if result else None
+    logger.info(f"[get_or_create_user] Creating user with data: {new_user}")
+    
+    try:
+        result = await supabase_client.insert("users", new_user)
+        logger.info(f"[get_or_create_user] User created successfully: {result[0] if result else None}")
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"[get_or_create_user] Error creating user: {e}")
+        raise
 
 
 def user_has_profile(user: dict) -> bool:

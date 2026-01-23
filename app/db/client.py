@@ -1,6 +1,8 @@
 import httpx
+import logging
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 SUPABASE_API = f"{settings.supabase_url}/rest/v1"
@@ -57,11 +59,15 @@ class SupabaseClient:
     ) -> list[dict]:
         payload = data if isinstance(data, list) else [data]
         async with httpx.AsyncClient(timeout=self.timeout) as client:
+            logger.info(f"[SupabaseClient.insert] table={table}, payload={payload}")
             resp = await client.post(
                 f"{self.api_url}/{table}",
                 headers=self.headers,
                 json=payload
             )
+            logger.info(f"[SupabaseClient.insert] status={resp.status_code}")
+            if resp.status_code >= 400:
+                logger.error(f"[SupabaseClient.insert] ERROR response: {resp.text}")
             resp.raise_for_status()
             return resp.json()
 

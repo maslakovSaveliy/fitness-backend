@@ -4,7 +4,11 @@ from .schemas import ProfileUpdateRequest, SettingsUpdateRequest
 
 
 def user_has_profile(user: dict) -> bool:
-    required_fields = ["goal", "level", "location"]
+    required_fields = [
+        "goal", "level", "health_issues", "location", 
+        "workouts_per_week", "workout_duration", "equipment", 
+        "workout_formats", "height", "weight", "age", "gender"
+    ]
     return all(user.get(field) for field in required_fields)
 
 
@@ -18,7 +22,19 @@ async def update_user_profile(user_id: str, data: ProfileUpdateRequest) -> dict:
         {"id": f"eq.{user_id}"},
         update_data
     )
-    return result[0] if result else None
+    
+    updated_user = result[0] if result else None
+    
+    # Проверяем и обновляем has_profile если все поля заполнены
+    if updated_user and user_has_profile(updated_user):
+        await supabase_client.update(
+            "users",
+            {"id": f"eq.{user_id}"},
+            {"has_profile": True}
+        )
+        updated_user["has_profile"] = True
+    
+    return updated_user
 
 
 async def update_user_settings(user_id: str, data: SettingsUpdateRequest) -> dict:
