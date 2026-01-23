@@ -32,6 +32,7 @@ class UserResponse(BaseModel):
     trial_expired: bool = False
     
     has_profile: bool = False
+    onboarding_completed: bool = False
 
 
 class ProfileUpdateRequest(BaseModel):

@@ -47,7 +47,8 @@ async def get_current_user_info(user: dict = Depends(get_current_user)):
         custom_split_frequency=user.get("custom_split_frequency"),
         last_muscle_group=user.get("last_muscle_group"),
         trial_expired=user.get("trial_expired", False),
-        has_profile=user_has_profile(user)
+        has_profile=user_has_profile(user),
+        onboarding_completed=user.get("onboarding_completed", False)
     )
 
 
@@ -84,7 +85,8 @@ async def update_profile(
         custom_split_frequency=updated_user.get("custom_split_frequency"),
         last_muscle_group=updated_user.get("last_muscle_group"),
         trial_expired=updated_user.get("trial_expired", False),
-        has_profile=user_has_profile(updated_user)
+        has_profile=user_has_profile(updated_user),
+        onboarding_completed=updated_user.get("onboarding_completed", False)
     )
 
 
@@ -121,7 +123,51 @@ async def update_settings(
         custom_split_frequency=updated_user.get("custom_split_frequency"),
         last_muscle_group=updated_user.get("last_muscle_group"),
         trial_expired=updated_user.get("trial_expired", False),
-        has_profile=user_has_profile(updated_user)
+        has_profile=user_has_profile(updated_user),
+        onboarding_completed=updated_user.get("onboarding_completed", False)
+    )
+
+
+@router.post("/me/complete-onboarding", response_model=UserResponse)
+async def complete_onboarding(user: dict = Depends(get_current_user)):
+    """Отметить онбординг как завершенный."""
+    from app.db import supabase_client
+    
+    result = await supabase_client.update(
+        "users",
+        {"id": f"eq.{user['id']}"},
+        {"onboarding_completed": True}
+    )
+    
+    updated_user = result[0] if result else user
+    
+    return UserResponse(
+        id=updated_user["id"],
+        telegram_id=updated_user["telegram_id"],
+        username=updated_user.get("username"),
+        first_name=updated_user.get("first_name"),
+        last_name=updated_user.get("last_name"),
+        goal=updated_user.get("goal"),
+        level=updated_user.get("level"),
+        health_issues=updated_user.get("health_issues"),
+        location=updated_user.get("location"),
+        workouts_per_week=updated_user.get("workouts_per_week"),
+        workout_duration=updated_user.get("workout_duration"),
+        equipment=updated_user.get("equipment"),
+        workout_formats=updated_user.get("workout_formats"),
+        height=updated_user.get("height"),
+        weight=updated_user.get("weight"),
+        age=updated_user.get("age"),
+        gender=updated_user.get("gender"),
+        is_paid=updated_user.get("is_paid", False),
+        paid_until=updated_user.get("paid_until"),
+        is_pro=updated_user.get("is_pro", False),
+        supersets_enabled=updated_user.get("supersets_enabled") if updated_user.get("supersets_enabled") is not None else False,
+        custom_split_frequency=updated_user.get("custom_split_frequency"),
+        last_muscle_group=updated_user.get("last_muscle_group"),
+        trial_expired=updated_user.get("trial_expired", False),
+        has_profile=user_has_profile(updated_user),
+        onboarding_completed=True
     )
 
 

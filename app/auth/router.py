@@ -46,7 +46,8 @@ async def authenticate_telegram(request: TelegramAuthRequest):
         last_name=user.get("last_name"),
         is_paid=user.get("is_paid", False),
         is_pro=user.get("is_pro", False),
-        has_profile=user_has_profile(user)
+        has_profile=user_has_profile(user),
+        onboarding_completed=user.get("onboarding_completed", False)
     )
     
     return TokenResponse(
@@ -91,7 +92,8 @@ async def dev_authenticate():
         last_name=user.get("last_name"),
         is_paid=user.get("is_paid", False),
         is_pro=user.get("is_pro", False),
-        has_profile=user_has_profile(user)
+        has_profile=user_has_profile(user),
+        onboarding_completed=user.get("onboarding_completed", False)
     )
     
     return TokenResponse(

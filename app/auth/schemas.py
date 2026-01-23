@@ -31,6 +31,7 @@ class UserResponse(BaseModel):
     is_paid: bool = False
     is_pro: bool = False
     has_profile: bool = False
+    onboarding_completed: bool = False
 
 
 TokenResponse.model_rebuild()

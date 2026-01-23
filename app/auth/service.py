@@ -111,6 +111,7 @@ async def get_or_create_user(tg_user: TelegramUser) -> dict:
         "is_pro": False,
         "trial_expired": False,
         "has_profile": False,
+        "onboarding_completed": False,
     }
     
     logger.info(f"[get_or_create_user] Creating user with data: {new_user}")
