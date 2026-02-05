@@ -19,6 +19,8 @@ class WorkoutStructured(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     muscle_groups: list[str] = Field(min_length=1, max_length=4)
     exercises: list[WorkoutStructuredExercise] = Field(min_length=1, max_length=30)
+    estimated_calories: Optional[int] = Field(default=None, ge=0, le=2000)
+    wellbeing_advice: Optional[str] = Field(default=None, max_length=500)
 
 
 class WorkoutBase(BaseModel):

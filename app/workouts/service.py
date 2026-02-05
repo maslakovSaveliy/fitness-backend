@@ -175,7 +175,8 @@ async def create_workout_draft(user: dict, data: WorkoutDraftCreateRequest) -> d
             target_muscle_group=used_muscle_group,
             wellbeing_reason=data.wellbeing_reason,
         )
-    calories_raw = workout_structured_raw.get("calories_burned")
+    # estimated_calories приходит из AI-сервиса, сохраняем в calories_burned в БД
+    calories_raw = workout_structured_raw.get("estimated_calories")
     calories_burned: int | None = None
     if isinstance(calories_raw, int) and calories_raw > 0:
         calories_burned = calories_raw
@@ -214,6 +215,20 @@ async def create_workout_draft(user: dict, data: WorkoutDraftCreateRequest) -> d
         return None
 
     return row
+
+
+async def get_active_draft(user_id: str) -> dict | None:
+    """Получить активный draft пользователя (последний по дате создания)."""
+    drafts = await supabase_client.get(
+        "workouts",
+        {
+            "user_id": f"eq.{user_id}",
+            "status": "eq.draft",
+            "order": "created_at.desc",
+            "limit": "1",
+        },
+    )
+    return drafts[0] if drafts else None
 
 
 async def delete_workout_draft(user_id: str, workout_id: str) -> bool:
@@ -287,6 +302,12 @@ async def replace_workout_draft(user: dict, workout_id: str) -> dict | None:
         used_muscle_group = await get_next_muscle_group_for_user(user)
         await _update_last_muscle_group(user["id"], used_muscle_group)
         target = used_muscle_group
+        workout_structured_raw = await ai_service.generate_workout_structured(
+            user,
+            target_muscle_group=target,
+            wellbeing_reason=wellbeing_reason,
+        )
+        workout_structured = WorkoutStructured.model_validate(workout_structured_raw)
     else:
         target = target_muscle_group or (
             ", ".join(selected_muscle_groups) if selected_muscle_groups else None

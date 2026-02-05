@@ -208,14 +208,14 @@ async def get_active_nutrition_plan(user_id: str) -> dict | None:
 
 
 async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate, user: dict) -> dict:
-    """Create nutrition plan with calculated KBJU targets based on user data and nutrition goal."""
+    """Create nutrition plan with formula-based KBJU targets."""
     await supabase_client.update(
         "nutrition_plans",
         {"user_id": f"eq.{user_id}", "is_active": "eq.true"},
         {"is_active": False}
     )
     
-    # Calculate KBJU targets based on user profile AND nutrition goal from brief
+    # Calculate KBJU targets using proven formula
     targets = calculate_kbju_targets(user, data.nutrition_goal)
     
     plan_data = {
@@ -362,23 +362,31 @@ def calculate_kbju_targets(user: dict, nutrition_goal: str | None = None) -> dic
     """
     Calculate KBJU targets based on user data and nutrition goal.
     
+    Uses Mifflin-St Jeor formula for BMR and evidence-based macro recommendations.
+    
     Args:
         user: User profile data (weight, height, age, gender, workouts_per_week)
         nutrition_goal: Goal from nutrition plan brief (e.g. "Похудеть", "Набрать массу")
-                       Takes priority over user.goal if provided
     """
+    # Parse user data with defaults
     try:
         weight = float(user.get('weight') or 70)
-        height = float(user.get('height') or 175)
+        height = float(user.get('height') or 170)
         age = float(user.get('age') or 30)
-        
-        if user.get('gender') == 'М':
-            bmr = 10 * weight + 6.25 * height - 5 * age + 5
-        else:
-            bmr = 10 * weight + 6.25 * height - 5 * age - 161
     except (ValueError, TypeError):
-        bmr = 1800
+        weight = 70
+        height = 170
+        age = 30
     
+    is_male = user.get('gender') == 'М'
+    
+    # BMR by Mifflin-St Jeor formula
+    if is_male:
+        bmr = 10 * weight + 6.25 * height - 5 * age + 5
+    else:
+        bmr = 10 * weight + 6.25 * height - 5 * age - 161
+    
+    # Activity multiplier based on workouts per week
     activity_level = user.get('workouts_per_week') or 3
     if isinstance(activity_level, str):
         try:
@@ -387,38 +395,69 @@ def calculate_kbju_targets(user: dict, nutrition_goal: str | None = None) -> dic
             activity_level = 3
     
     if activity_level <= 1:
-        activity_multiplier = 1.2
-    elif activity_level <= 3:
-        activity_multiplier = 1.375
-    elif activity_level <= 5:
-        activity_multiplier = 1.55
+        activity_multiplier = 1.2      # Sedentary
+    elif activity_level <= 2:
+        activity_multiplier = 1.375    # Light activity
+    elif activity_level <= 4:
+        activity_multiplier = 1.55     # Moderate activity
     else:
-        activity_multiplier = 1.725
+        activity_multiplier = 1.725    # Very active
     
     tdee = bmr * activity_multiplier
     
-    # Use nutrition_goal from plan if provided, otherwise fall back to user.goal
+    # Parse goal
     goal = (nutrition_goal or user.get('goal') or '').lower()
     
-    if 'похудеть' in goal or 'сбросить' in goal or 'снижение' in goal or 'похудение' in goal:
-        target_calories = tdee - 500
-        protein_percent, fat_percent, carb_percent = 35, 25, 40
-    elif 'набрать' in goal or 'массу' in goal or 'набор' in goal or 'масса' in goal:
-        target_calories = tdee + 300
-        protein_percent, fat_percent, carb_percent = 30, 20, 50
-    elif 'поддерж' in goal or 'форм' in goal:
-        target_calories = tdee
-        protein_percent, fat_percent, carb_percent = 30, 25, 45
+    # Scientific recommendations for macros:
+    # - Protein: 1.4-1.8 g/kg for most people, up to 2.0 g/kg only for athletes on hard deficit
+    # - Fat: 0.7-1.0 g/kg minimum for hormonal health
+    # - Carbs: remaining calories
+    
+    if 'похудеть' in goal or 'сбросить' in goal or 'снижение' in goal or 'похудение' in goal or 'дефицит' in goal:
+        # Weight loss: 400-500 kcal deficit, higher protein to preserve muscle
+        calorie_adjustment = -450
+        protein_per_kg = 1.8
+        fat_per_kg = 0.8
+    elif 'набрать' in goal or 'массу' in goal or 'набор' in goal or 'масса' in goal or 'профицит' in goal:
+        # Muscle gain: 250-350 kcal surplus
+        calorie_adjustment = 300
+        protein_per_kg = 1.6
+        fat_per_kg = 1.0
+    elif 'поддерж' in goal or 'форм' in goal or 'рекомпозиц' in goal:
+        # Maintenance
+        calorie_adjustment = 0
+        protein_per_kg = 1.5
+        fat_per_kg = 0.9
     else:
-        # Default: slight deficit for general health
-        target_calories = tdee - 200
-        protein_percent, fat_percent, carb_percent = 30, 25, 45
+        # Default: slight deficit for health
+        calorie_adjustment = -200
+        protein_per_kg = 1.5
+        fat_per_kg = 0.85
+    
+    target_calories = tdee + calorie_adjustment
+    
+    # Minimum calories for health (prevent too low values)
+    min_calories = 1200 if not is_male else 1500
+    target_calories = max(min_calories, target_calories)
+    
+    # Calculate macros from weight
+    target_proteins = int(weight * protein_per_kg)
+    target_fats = int(weight * fat_per_kg)
+    
+    # Carbs = remaining calories
+    protein_calories = target_proteins * 4
+    fat_calories = target_fats * 9
+    remaining_calories = target_calories - protein_calories - fat_calories
+    target_carbs = max(80, int(remaining_calories / 4))  # Minimum 80g carbs for brain function
+    
+    # Recalculate total calories to match actual macros
+    actual_calories = protein_calories + fat_calories + (target_carbs * 4)
     
     return {
-        "target_calories": int(target_calories),
-        "target_proteins": int((target_calories * protein_percent / 100) / 4),
-        "target_fats": int((target_calories * fat_percent / 100) / 9),
-        "target_carbs": int((target_calories * carb_percent / 100) / 4)
+        "target_calories": int(actual_calories),
+        "target_proteins": target_proteins,
+        "target_fats": target_fats,
+        "target_carbs": target_carbs
     }
 
 

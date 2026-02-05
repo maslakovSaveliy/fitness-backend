@@ -18,10 +18,12 @@ from .prompts import (
     FOOD_CLARIFICATION_PROMPT,
     DAILY_MENU_SYSTEM_PROMPT,
     SHOPPING_LIST_SYSTEM_PROMPT,
+    KBJU_CALCULATION_SYSTEM_PROMPT,
     build_daily_menu_prompt,
     build_daily_menu_structured_prompt,
     build_weekly_menu_structured_prompt,
     build_shopping_list_prompt,
+    build_kbju_calculation_prompt,
 )
 
 settings = get_settings()
@@ -646,6 +648,68 @@ class AIService:
             raise RuntimeError("AI returned empty food analysis")
         return result
 
+    async def calculate_kbju_targets(self, user: dict, nutrition_brief: dict) -> dict:
+        """Calculate personalized KBJU targets using AI."""
+        if not settings.openai_api_key:
+            logger.error("openai_api_key_is_missing")
+            raise RuntimeError("OpenAI API key is missing")
+
+        logger.info("ai_calculate_kbju_request", extra={"user_id": user.get("id")})
+
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": KBJU_CALCULATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": build_kbju_calculation_prompt(user, nutrition_brief)},
+                ],
+                temperature=0.3,  # Lower temperature for more consistent calculations
+            )
+
+            raw = response.choices[0].message.content or ""
+            raw = raw.strip()
+            
+            # Clean up markdown if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+
+            parsed = json.loads(raw)
+            
+            # Validate required fields
+            required_fields = ["target_calories", "target_proteins", "target_fats", "target_carbs"]
+            for field in required_fields:
+                if field not in parsed:
+                    raise ValueError(f"Missing field: {field}")
+                parsed[field] = int(parsed[field])
+            
+            # Sanity checks
+            if parsed["target_calories"] < 1000 or parsed["target_calories"] > 5000:
+                logger.warning("ai_kbju_calories_out_of_range", extra={"calories": parsed["target_calories"]})
+            
+            logger.info(
+                "ai_calculate_kbju_success",
+                extra={
+                    "user_id": user.get("id"),
+                    "targets": {k: v for k, v in parsed.items() if k != "reasoning"},
+                },
+            )
+            
+            return parsed
+
+        except json.JSONDecodeError as e:
+            logger.error(
+                "ai_calculate_kbju_parse_failed",
+                extra={"user_id": user.get("id"), "error": str(e), "raw_preview": raw[:300] if raw else ""},
+            )
+            raise RuntimeError("AI returned invalid JSON for KBJU calculation")
+        except Exception as e:
+            logger.error(
+                "ai_calculate_kbju_error",
+                extra={"user_id": user.get("id"), "error": str(e)},
+            )
+            raise
+
     async def generate_daily_menu(self, user: dict, nutrition_plan: dict) -> str:
         """Legacy method for text-based menu generation."""
         if not settings.openai_api_key:
@@ -1140,12 +1204,19 @@ class AIService:
         else:
             calories_burned = None
 
+        # Обрабатываем wellbeing_advice для тренировок по самочувствию
+        wellbeing_advice_raw = raw.get("wellbeing_advice")
+        wellbeing_advice: str | None = None
+        if isinstance(wellbeing_advice_raw, str) and wellbeing_advice_raw.strip():
+            wellbeing_advice = wellbeing_advice_raw.strip()[:500]
+
         return {
             "version": int(version),
             "title": str(title).strip(),
             "muscle_groups": muscle_groups,
             "exercises": exercises,
-            "calories_burned": calories_burned,
+            "estimated_calories": calories_burned,
+            "wellbeing_advice": wellbeing_advice,
         }
 
     def _normalize_exercise(self, raw: dict) -> dict:

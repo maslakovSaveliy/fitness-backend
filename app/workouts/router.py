@@ -25,6 +25,7 @@ from .service import (
     create_workout,
     log_manual_workout,
     create_workout_draft,
+    get_active_draft,
     delete_workout_draft,
     replace_workout_draft,
     replace_workout_exercise,
@@ -123,6 +124,31 @@ async def add_workout(
         rating=workout.get("rating"),
         comment=workout.get("comment"),
         created_at=workout.get("created_at")
+    )
+
+
+@router.get("/drafts/active", response_model=WorkoutResponse | None)
+async def get_active_draft_endpoint(
+    user: dict = Depends(get_current_user),
+):
+    """Получить активный draft пользователя (если есть)."""
+    draft = await get_active_draft(user["id"])
+    if not draft:
+        return None
+
+    details_text, details_structured = _details_to_response_fields(draft.get("details"))
+    return WorkoutResponse(
+        id=draft["id"],
+        user_id=draft["user_id"],
+        date=draft["date"],
+        workout_type=draft["workout_type"],
+        details=details_text,
+        details_structured=details_structured,
+        calories_burned=draft.get("calories_burned"),
+        status=draft.get("status"),
+        rating=draft.get("rating"),
+        comment=draft.get("comment"),
+        created_at=draft.get("created_at"),
     )
 
 
