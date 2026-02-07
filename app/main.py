@@ -18,6 +18,7 @@ from app.reminders.scheduler import start_scheduler
 from app.feedback import feedback_router
 from app.admin import admin_router
 from app.trial import trial_router
+from app.promo import promo_router
 
 settings = get_settings()
 
@@ -72,6 +73,7 @@ app.include_router(broadcast_router)
 app.include_router(feedback_router)
 app.include_router(admin_router)
 app.include_router(trial_router)
+app.include_router(promo_router)
 
 _scheduler = None
 
