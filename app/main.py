@@ -27,6 +27,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
+NOISY_LOGGERS = ("httpcore", "httpx", "openai", "hpack")
+for _name in NOISY_LOGGERS:
+    logging.getLogger(_name).setLevel(logging.WARNING)
+
 app = FastAPI(
     title="Fitness Mini App API",
     description="Backend API for Fitness Telegram Mini App",
