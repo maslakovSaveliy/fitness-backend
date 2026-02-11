@@ -1163,6 +1163,14 @@ class AIService:
             if not isinstance(name, str) or not name.strip():
                 continue
 
+            # Фильтруем советы/подсказки, которые AI иногда добавляет как упражнения
+            stripped = name.strip().lower()
+            if stripped.startswith("*") or stripped.startswith("совет") or stripped.startswith("важно"):
+                continue
+            skip_keywords = ("следите", "не забудь", "обратите внимание", "рекоменд", "старайтесь", "помните")
+            if any(stripped.startswith(kw) for kw in skip_keywords):
+                continue
+
             reps = item.get("reps")
             if not isinstance(reps, int):
                 reps = 12
