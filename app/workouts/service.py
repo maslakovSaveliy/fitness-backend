@@ -67,6 +67,8 @@ async def clone_completed_workout_to_draft(
     workout_id: str,
     draft_date: dt_date,
 ) -> dict | None:
+    await _cleanup_old_drafts(user["id"])
+
     source = await supabase_client.get_one(
         "workouts",
         {"id": f"eq.{workout_id}", "user_id": f"eq.{user['id']}", "status": "eq.completed"},
@@ -147,6 +149,8 @@ def _draft_workout_type(
 
 
 async def create_workout_draft(user: dict, data: WorkoutDraftCreateRequest) -> dict:
+    await _cleanup_old_drafts(user["id"])
+
     selected_muscle_groups = data.muscle_groups
     if not selected_muscle_groups and data.muscle_group:
         selected_muscle_groups = [data.muscle_group]
@@ -217,8 +221,11 @@ async def create_workout_draft(user: dict, data: WorkoutDraftCreateRequest) -> d
     return row
 
 
+DRAFT_TTL_HOURS = 24
+
+
 async def get_active_draft(user_id: str) -> dict | None:
-    """Получить активный draft пользователя (последний по дате создания)."""
+    """Получить активный draft: последний, не старше 24ч, без completed-тренировки после него."""
     drafts = await supabase_client.get(
         "workouts",
         {
@@ -228,7 +235,66 @@ async def get_active_draft(user_id: str) -> dict | None:
             "limit": "1",
         },
     )
-    return drafts[0] if drafts else None
+    if not drafts:
+        return None
+
+    draft = drafts[0]
+    draft_created_at = draft.get("created_at")
+
+    if not draft_created_at:
+        return draft
+
+    try:
+        created_dt = datetime.fromisoformat(str(draft_created_at).replace("Z", "+00:00"))
+        now = datetime.now(created_dt.tzinfo)
+        if (now - created_dt) > timedelta(hours=DRAFT_TTL_HOURS):
+            await _delete_draft_silent(user_id, draft["id"])
+            return None
+    except Exception:
+        pass
+
+    completed_after = await supabase_client.get(
+        "workouts",
+        {
+            "user_id": f"eq.{user_id}",
+            "status": "eq.completed",
+            "created_at": f"gt.{draft_created_at}",
+            "order": "created_at.desc",
+            "limit": "1",
+        },
+    )
+    if completed_after:
+        await _delete_draft_silent(user_id, draft["id"])
+        return None
+
+    return draft
+
+
+async def _delete_draft_silent(user_id: str, draft_id: str) -> None:
+    """Удалить draft без ошибок (best-effort cleanup)."""
+    try:
+        await supabase_client.delete(
+            "workouts",
+            {"id": f"eq.{draft_id}", "user_id": f"eq.{user_id}", "status": "eq.draft"},
+        )
+    except Exception:
+        pass
+
+
+async def _cleanup_old_drafts(user_id: str) -> None:
+    """Удалить все существующие draft'ы пользователя (перед созданием нового)."""
+    old_drafts = await supabase_client.get(
+        "workouts",
+        {
+            "user_id": f"eq.{user_id}",
+            "status": "eq.draft",
+            "select": "id",
+        },
+    )
+    if not old_drafts:
+        return
+    for old in old_drafts:
+        await _delete_draft_silent(user_id, old["id"])
 
 
 async def delete_workout_draft(user_id: str, workout_id: str) -> bool:
