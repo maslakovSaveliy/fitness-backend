@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from app.db import supabase_client
 from .schemas import ProfileUpdateRequest, SettingsUpdateRequest
 
@@ -138,33 +138,36 @@ async def calculate_workout_streak(user_id: str) -> int:
             "status": "eq.completed",
             "select": "date",
             "order": "date.desc",
-            "limit": "30"
+            "limit": "60"
         }
     )
-    
+
     if not workouts:
         return 0
-    
-    workout_dates = set()
+
+    unique_dates: list[date] = []
+    seen: set[str] = set()
     for w in workouts:
         try:
             date_str = w.get("date", "")[:10]
-            workout_dates.add(date_str)
+            if date_str and date_str not in seen:
+                seen.add(date_str)
+                unique_dates.append(date.fromisoformat(date_str))
         except Exception:
             continue
-    
-    streak = 0
-    current_date = datetime.utcnow().date()
-    
-    while True:
-        date_str = current_date.isoformat()
-        if date_str in workout_dates:
+
+    if not unique_dates:
+        return 0
+
+    unique_dates.sort(reverse=True)
+
+    streak = 1
+    for i in range(1, len(unique_dates)):
+        diff = (unique_dates[i - 1] - unique_dates[i]).days
+        if diff == 1:
             streak += 1
-            current_date -= timedelta(days=1)
         else:
-            if streak == 0 and (current_date + timedelta(days=1)).isoformat() not in workout_dates:
-                break
             break
-    
+
     return streak
 

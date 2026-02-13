@@ -94,6 +94,21 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/debug/token/{telegram_id}")
+async def debug_token(telegram_id: int):
+    """Выдаёт JWT для тестирования. Работает только в debug-режиме."""
+    if not settings.debug:
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+    from app.db import supabase_client
+    from app.auth.service import create_access_token
+    users = await supabase_client.get("users", {"telegram_id": f"eq.{telegram_id}", "limit": "1"})
+    if not users:
+        return {"error": "user not found"}
+    user = users[0]
+    token = create_access_token(telegram_id, user["id"])
+    return {"token": token, "user_id": user["id"]}
+
+
 @app.get("/")
 async def root():
     return {

@@ -363,23 +363,39 @@ class AIService:
             existing_exercise_names=existing_exercise_names,
         )
 
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.4,
-            max_tokens=350,
-            response_format={"type": "json_object"},
-        )
+        existing_lower = {n.lower().strip() for n in existing_exercise_names}
+        max_attempts = 3
+        temperature = 0.6
 
-        raw = (response.choices[0].message.content or "").strip()
-        parsed = self._extract_json_object(raw)
-        if not parsed:
-            raise RuntimeError("AI returned invalid JSON for exercise")
+        for attempt in range(max_attempts):
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                max_tokens=350,
+                response_format={"type": "json_object"},
+            )
 
-        return self._normalize_exercise(parsed)
+            raw = (response.choices[0].message.content or "").strip()
+            parsed = self._extract_json_object(raw)
+            if not parsed:
+                raise RuntimeError("AI returned invalid JSON for exercise")
+
+            normalized = self._normalize_exercise(parsed)
+            if normalized["name"].lower().strip() not in existing_lower:
+                return normalized
+
+            logger.warning(
+                "exercise_replacement_duplicate attempt=%d name=%s",
+                attempt + 1,
+                normalized["name"],
+            )
+            temperature = min(temperature + 0.15, 1.0)
+
+        return normalized
 
     async def generate_workout(
         self,
@@ -1150,11 +1166,19 @@ class AIService:
             muscle_groups = [str(fallback_muscle_group)]
         muscle_groups = [str(x) for x in muscle_groups[:2]]
 
+        requested_parts = [p.strip().lower() for p in fallback_muscle_group.split(",") if p.strip()]
+        if requested_parts:
+            ai_lower = [g.lower() for g in muscle_groups]
+            has_overlap = any(rp in ag or ag in rp for rp in requested_parts for ag in ai_lower)
+            if not has_overlap:
+                muscle_groups = [p.strip() for p in fallback_muscle_group.split(",") if p.strip()][:2]
+
         exercises_raw = raw.get("exercises")
         if not isinstance(exercises_raw, list) or not exercises_raw:
             raise RuntimeError("structured workout has empty exercises")
 
         exercises: list[dict] = []
+        seen_names: set[str] = set()
         for item in exercises_raw[:12]:
             if not isinstance(item, dict):
                 continue
@@ -1186,8 +1210,14 @@ class AIService:
                 weight = 4
             weight = min(allowed_weight, key=lambda x: abs(x - weight))
 
+            normalized_name = name.strip()
+            name_key = normalized_name.lower()
+            if name_key in seen_names:
+                continue
+            seen_names.add(name_key)
+
             exercises.append(
-                {"name": name.strip(), "weight_kg": weight, "sets": sets, "reps": reps}
+                {"name": normalized_name, "weight_kg": weight, "sets": sets, "reps": reps}
             )
 
         if not exercises:

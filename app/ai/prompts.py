@@ -232,8 +232,8 @@ def build_workout_structured_prompt(
         else f"- Не добавляй упражнения на другие группы мышц, кроме {selected_groups_text}"
     )
 
-    # ВАЖНО: Фронт ожидает структуру 1-в-1 под UI (мышцы + упражнения с вес/подходы/повторы).
-    # Просим AI вернуть только JSON, чтобы не было мусора вокруг.
+    muscle_groups_example = json.dumps(selected_groups, ensure_ascii=False)
+
     return f"""Ты профессиональный фитнес-тренер. Составь тренировку СТРОГО в формате JSON (без Markdown, без пояснений).
 
 ДАННЫЕ ПОЛЬЗОВАТЕЛЯ:
@@ -257,7 +257,7 @@ def build_workout_structured_prompt(
 {{
   "version": 1,
   "title": "Короткий заголовок тренировки",
-  "muscle_groups": ["Спина", "Плечи"],
+  "muscle_groups": {muscle_groups_example},
   "exercises": [
     {{"name": "Название упражнения", "weight_kg": 4, "sets": 3, "reps": 12}}
   ],
@@ -275,6 +275,7 @@ def build_workout_structured_prompt(
 ПРАВИЛА:
 {allowed_rule}
 {balance_rule}
+- Все упражнения в тренировке должны быть УНИКАЛЬНЫМИ. Никогда не повторяй одно и то же упражнение дважды
 - Учитывай оборудование и ограничения
 - Избегай повторов из последних тренировок, если возможно
 - В массиве exercises должны быть ТОЛЬКО упражнения. НЕ добавляй советы, подсказки, комментарии или рекомендации в exercises
@@ -304,7 +305,7 @@ def build_workout_single_exercise_prompt(
 {superset_info}
 {workout_history_info}
 
-УЖЕ ЕСТЬ В ТРЕНИРОВКЕ (избегай повторов по названию): {existing}
+ЗАПРЕЩЁННЫЕ УПРАЖНЕНИЯ (НИКОГДА не возвращай ни одно из них, даже с изменённым названием): {existing}
 
 ФОРМАТ JSON:
 {{
