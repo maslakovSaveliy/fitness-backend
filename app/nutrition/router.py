@@ -12,7 +12,6 @@ from .schemas import (
     NutritionPlanCreate,
     NutritionPlanResponse,
     KBJURecommendations,
-    NutritionPlanMenuResponse,
     DailyMenuStructured,
     DailyMenuStructuredResponse,
     WeekMenuResponse,
@@ -29,7 +28,6 @@ from .service import (
     get_active_nutrition_plan,
     create_nutrition_plan,
     get_kbju_recommendations,
-    create_daily_menu,
     create_weekly_menu,
     get_menu_by_day_of_week,
     get_week_menus,
@@ -242,23 +240,6 @@ async def create_plan(
         target_fats=plan.get("target_fats"),
         target_carbs=plan.get("target_carbs"),
         created_at=plan.get("created_at")
-    )
-
-
-@router.get("/plans/active/menu", response_model=NutritionPlanMenuResponse)
-async def get_active_plan_menu(user: dict = Depends(get_current_paid_user)):
-    """Legacy: Сгенерировать новый дневной рацион на основе активного плана (текстовый формат)."""
-    plan = await get_active_nutrition_plan(user["id"])
-    if not plan:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active nutrition plan not found")
-
-    menu = await create_daily_menu(user, plan)
-    return NutritionPlanMenuResponse(
-        id=menu["id"],
-        plan_id=menu["plan_id"],
-        date=menu["date"],
-        menu_text=menu["menu_text"],
-        created_at=menu.get("created_at"),
     )
 
 

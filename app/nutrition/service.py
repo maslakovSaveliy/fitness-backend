@@ -2,6 +2,7 @@ import json
 from datetime import date as dt_date
 from app.db import supabase_client
 from app.ai import ai_service
+from app.ai.schemas import FoodAnalysisAIOutput
 from .schemas import MealCreate, NutritionPlanCreate, FoodAnalyzeResponse
 
 
@@ -71,30 +72,23 @@ async def create_meal(user_id: str, data: MealCreate) -> dict:
 
 async def analyze_food_photo(
     image_url: str,
-    clarification: str | None = None
+    clarification: str | None = None,
 ) -> FoodAnalyzeResponse:
-    if clarification:
-        response = await ai_service.analyze_food_with_clarification(image_url, clarification)
-    else:
-        response = await ai_service.analyze_food_photo(image_url)
-    
-    json_start = response.find('{')
-    json_end = response.rfind('}')
-    
-    if json_start != -1 and json_end != -1 and json_end > json_start:
-        try:
-            data = json.loads(response[json_start:json_end+1])
-            return FoodAnalyzeResponse(
-                description=data.get("description", "Блюдо"),
-                calories=data.get("calories"),
-                proteins=data.get("proteins"),
-                fats=data.get("fats"),
-                carbs=data.get("carbs")
-            )
-        except json.JSONDecodeError:
-            pass
-    
-    return FoodAnalyzeResponse(description="Не удалось распознать блюдо")
+    try:
+        result: FoodAnalysisAIOutput
+        if clarification:
+            result = await ai_service.analyze_food_with_clarification(image_url, clarification)
+        else:
+            result = await ai_service.analyze_food_photo(image_url)
+        return FoodAnalyzeResponse(
+            description=result.description,
+            calories=result.calories,
+            proteins=result.proteins,
+            fats=result.fats,
+            carbs=result.carbs,
+        )
+    except Exception:
+        return FoodAnalyzeResponse(description="Не удалось распознать блюдо")
 
 
 async def analyze_food_photo_with_history(
@@ -114,25 +108,17 @@ async def analyze_food_photo_with_history(
 
 async def analyze_food_description(description: str) -> FoodAnalyzeResponse:
     """Analyze food from text description only (no photo)."""
-    response = await ai_service.analyze_food_description(description)
-    
-    json_start = response.find('{')
-    json_end = response.rfind('}')
-    
-    if json_start != -1 and json_end != -1 and json_end > json_start:
-        try:
-            data = json.loads(response[json_start:json_end+1])
-            return FoodAnalyzeResponse(
-                description=data.get("description", description),
-                calories=data.get("calories"),
-                proteins=data.get("proteins"),
-                fats=data.get("fats"),
-                carbs=data.get("carbs")
-            )
-        except json.JSONDecodeError:
-            pass
-    
-    return FoodAnalyzeResponse(description=description)
+    try:
+        result = await ai_service.analyze_food_description(description)
+        return FoodAnalyzeResponse(
+            description=result.description,
+            calories=result.calories,
+            proteins=result.proteins,
+            fats=result.fats,
+            carbs=result.carbs,
+        )
+    except Exception:
+        return FoodAnalyzeResponse(description=description)
 
 
 async def get_daily_nutrition_stats(
@@ -234,21 +220,6 @@ async def create_nutrition_plan(user_id: str, data: NutritionPlanCreate, user: d
     
     result = await supabase_client.insert("nutrition_plans", plan_data)
     return result[0] if result else None
-
-
-async def create_daily_menu(user: dict, plan: dict) -> dict:
-    """Legacy function for text-based menu generation."""
-    from datetime import date as dt_date_today
-    today = dt_date_today.today()
-    menu_text = await ai_service.generate_daily_menu(user, plan)
-
-    payload = {
-        "plan_id": plan["id"],
-        "date": today.isoformat(),
-        "menu_text": menu_text,
-    }
-    result = await supabase_client.insert("nutrition_plan_menus", payload)
-    return result[0] if result else {"id": "", **payload}
 
 
 async def create_weekly_menu(user: dict, plan: dict) -> list[dict]:

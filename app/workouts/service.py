@@ -596,27 +596,17 @@ def _extract_json_object(raw: str) -> dict | None:
 
 
 async def analyze_manual_workout(user: dict, description: str) -> dict:
-    raw = await ai_service.analyze_manual_workout(description, user)
-    parsed = _extract_json_object(raw)
-    if not parsed:
+    try:
+        result = await ai_service.analyze_manual_workout(description, user)
+        improved_description = result.improved_description or description
+        post_workout_advice = result.post_workout_advice or "Отличная работа! Продолжай в том же духе!"
+        calories_burned: int | None = result.calories_burned
+    except Exception:
         return {
             "improved_description": description,
             "calories_burned": None,
-            "post_workout_advice": "Отличная работа! Продолжай в том же духе! 💪",
+            "post_workout_advice": "Отличная работа! Продолжай в том же духе!",
         }
-
-    improved_description = parsed.get("improved_description") or description
-    post_workout_advice = parsed.get("post_workout_advice") or "Отличная работа! Продолжай в том же духе! 💪"
-    calories_burned = parsed.get("calories_burned")
-    if isinstance(calories_burned, bool):
-        calories_burned = None
-    if isinstance(calories_burned, float):
-        calories_burned = int(calories_burned)
-    if isinstance(calories_burned, str):
-        try:
-            calories_burned = int(float(calories_burned))
-        except Exception:
-            calories_burned = None
 
     if not isinstance(calories_burned, int):
         calories_burned = None

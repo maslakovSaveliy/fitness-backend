@@ -1,57 +1,56 @@
-import json
+import asyncio
 import logging
 import random
 import re
+from collections.abc import AsyncGenerator
+
 from openai import AsyncOpenAI
+
 from app.config import get_settings
 from app.db import supabase_client
 from .prompts import (
     WORKOUT_SPLITS,
     SPLIT_DESCRIPTIONS,
     TIP_TYPES,
-    build_workout_prompt,
     build_workout_structured_prompt,
     build_workout_single_exercise_prompt,
     build_manual_workout_infer_prompt,
     build_wellbeing_workout_structured_prompt,
-    FOOD_ANALYSIS_PROMPT,
-    FOOD_CLARIFICATION_PROMPT,
-    DAILY_MENU_SYSTEM_PROMPT,
+    FOOD_ANALYSIS_SYSTEM,
+    FOOD_ANALYSIS_USER,
+    FOOD_CLARIFICATION_SYSTEM,
+    FOOD_DESCRIPTION_SYSTEM,
+    MANUAL_WORKOUT_ANALYSIS_SYSTEM,
+    DAILY_MENU_SYSTEM,
     SHOPPING_LIST_SYSTEM_PROMPT,
-    KBJU_CALCULATION_SYSTEM_PROMPT,
-    build_daily_menu_prompt,
     build_daily_menu_structured_prompt,
-    build_weekly_menu_structured_prompt,
     build_shopping_list_prompt,
-    build_kbju_calculation_prompt,
+    TRAINER_CHAT_WORKOUT_SYSTEM,
+)
+from .schemas import (
+    WorkoutAIOutput,
+    ExerciseAIOutput,
+    WorkoutMetadataAIOutput,
+    ManualWorkoutAnalysisAIOutput,
+    FoodAnalysisAIOutput,
+    DailyMenuAIOutput,
 )
 
 settings = get_settings()
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 logger = logging.getLogger(__name__)
 
+MIN_CALORIES = 20
+MAX_CALORIES = 2000
+MAX_EXERCISE_REPLACE_ATTEMPTS = 3
+EXERCISE_REPLACE_TEMP_START = 0.6
+EXERCISE_REPLACE_TEMP_STEP = 0.15
+
 
 class AIService:
-    def _details_to_text(self, details_value: object) -> str:
-        if details_value is None:
-            return ""
-        if isinstance(details_value, str):
-            return details_value
-        if isinstance(details_value, dict):
-            # Если это structured workout (dict), лучше превратить в читаемый текст,
-            # чтобы работали и "avoid repeats", и история выглядела как в боте.
-            try:
-                from app.workouts.schemas import WorkoutStructured
-                from app.workouts.service import _format_workout_text
-
-                structured = WorkoutStructured.model_validate(details_value)
-                return _format_workout_text(structured)
-            except Exception:
-                try:
-                    return json.dumps(details_value, ensure_ascii=False)
-                except Exception:
-                    return str(details_value)
-        return str(details_value)
+    # ------------------------------------------------------------------
+    # Workouts
+    # ------------------------------------------------------------------
 
     async def generate_workout_structured(
         self,
@@ -60,16 +59,11 @@ class AIService:
         wellbeing_reason: str | None = None,
     ) -> dict:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
-
-        exercise_count = random.randint(5, 8)
-        tip_type = random.choice(TIP_TYPES)
 
         attendance_data = await self._calculate_attendance(user["id"])
         real_frequency = attendance_data["real_frequency"]
         recommended_split = attendance_data["recommended_split"]
-
         use_supersets = self._should_use_supersets(user)
 
         custom_frequency = user.get("custom_split_frequency")
@@ -80,10 +74,7 @@ class AIService:
             display_frequency = real_frequency
             display_split = recommended_split
 
-        if target_muscle_group:
-            chosen_group = target_muscle_group
-        else:
-            chosen_group = random.choice(display_split)
+        chosen_group = target_muscle_group or random.choice(display_split)
 
         split_description = SPLIT_DESCRIPTIONS.get(display_frequency, SPLIT_DESCRIPTIONS[3])
         split_type = "выбранный" if custom_frequency is not None else "рекомендованный"
@@ -94,17 +85,7 @@ class AIService:
             f"Сегодня тренируем: {chosen_group}."
         )
 
-        if use_supersets:
-            superset_info = (
-                "Пользователь предпочитает интенсивные форматы тренировок. "
-                "Включи суперсеты там, где это уместно."
-            )
-        else:
-            superset_info = (
-                "ВАЖНО: Пользователь отключил суперсеты. НЕ используй суперсеты. "
-                "Каждое упражнение должно быть отдельным с отдыхом между подходами."
-            )
-
+        superset_info = self._build_superset_info(use_supersets)
         workout_history_info, exercises_info = await self._get_workout_history_info(user["id"])
 
         prompt = build_workout_structured_prompt(
@@ -117,105 +98,19 @@ class AIService:
         )
 
         if wellbeing_reason:
-            wellbeing_block = (
+            prompt += (
                 "\n\nДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ:\n"
                 f"Пользователь не может выполнить полноценную тренировку по причине: {wellbeing_reason}.\n"
                 "Составь альтернативную тренировку с учётом этого ограничения.\n"
             )
-            prompt = f"{prompt}{wellbeing_block}"
 
         logger.info(
-            "ai_generate_workout_structured_request",
-            extra={
-                "user_id": user.get("id"),
-                "telegram_id": user.get("telegram_id"),
-                "chosen_group": chosen_group,
-                "exercise_count": exercise_count,
-                "use_supersets": use_supersets,
-                "custom_split_frequency": custom_frequency,
-            },
+            "ai_generate_workout_structured",
+            extra={"user_id": user.get("id"), "chosen_group": chosen_group, "use_supersets": use_supersets},
         )
 
-        try:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-                max_tokens=1100,
-                response_format={"type": "json_object"},
-            )
-        except TypeError:
-            # На случай старой версии openai SDK, где response_format может отсутствовать
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.4,
-                max_tokens=1100,
-            )
-
-        raw = (response.choices[0].message.content or "").strip()
-        parsed = self._extract_json_object(raw)
-        if not parsed:
-            logger.error(
-                "ai_generate_workout_structured_parse_failed",
-                extra={
-                    "user_id": user.get("id"),
-                    "telegram_id": user.get("telegram_id"),
-                    "raw_len": len(raw),
-                    "raw_preview": raw[:300],
-                },
-            )
-
-            # Попытка "починки" ответа: попросим вернуть валидный JSON без лишнего текста.
-            repair_prompt = (
-                "Исправь ответ, чтобы он был ВАЛИДНЫМ JSON-объектом (без Markdown, без пояснений). "
-                "Верни только JSON.\n\n"
-                f"ВОТ ТЕКУЩИЙ ОТВЕТ:\n{raw}"
-            )
-            try:
-                repair_response = await client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                        {"role": "user", "content": repair_prompt},
-                    ],
-                    temperature=0.0,
-                    max_tokens=1100,
-                    response_format={"type": "json_object"},
-                )
-            except TypeError:
-                repair_response = await client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                        {"role": "user", "content": repair_prompt},
-                    ],
-                    temperature=0.0,
-                    max_tokens=1100,
-                )
-
-            repaired_raw = (repair_response.choices[0].message.content or "").strip()
-            parsed = self._extract_json_object(repaired_raw)
-            if not parsed:
-                logger.error(
-                    "ai_generate_workout_structured_repair_failed",
-                    extra={
-                        "user_id": user.get("id"),
-                        "telegram_id": user.get("telegram_id"),
-                        "raw_len": len(repaired_raw),
-                        "raw_preview": repaired_raw[:300],
-                    },
-                )
-                raise RuntimeError("AI returned invalid JSON for structured workout")
-
-        normalized = self._normalize_structured_workout(parsed, fallback_muscle_group=chosen_group)
-        return normalized
+        parsed = await self._parse(WorkoutAIOutput, prompt, temperature=0.4, max_tokens=1100)
+        return self._normalize_structured_workout(parsed, fallback_muscle_group=chosen_group)
 
     async def generate_wellbeing_workout_structured(
         self,
@@ -224,13 +119,11 @@ class AIService:
         avoid_exercise_names: list[str] | None = None,
     ) -> dict:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
         attendance_data = await self._calculate_attendance(user["id"])
         real_frequency = attendance_data["real_frequency"]
         recommended_split = attendance_data["recommended_split"]
-
         use_supersets = self._should_use_supersets(user)
 
         custom_frequency = user.get("custom_split_frequency")
@@ -241,7 +134,6 @@ class AIService:
             display_frequency = real_frequency
             display_split = recommended_split
 
-        # Фоллбек-группа нужна только для нормализации, если AI вернёт пусто/мусор.
         fallback_group = random.choice(display_split) if display_split else "общий комплекс"
 
         split_description = SPLIT_DESCRIPTIONS.get(display_frequency, SPLIT_DESCRIPTIONS[3])
@@ -252,17 +144,7 @@ class AIService:
             f"{split_type.title()} сплит: {split_description}."
         )
 
-        if use_supersets:
-            superset_info = (
-                "Пользователь предпочитает интенсивные форматы тренировок. "
-                "Суперсеты допустимы, но используй их осторожно с учётом самочувствия."
-            )
-        else:
-            superset_info = (
-                "ВАЖНО: Пользователь отключил суперсеты. НЕ используй суперсеты. "
-                "Каждое упражнение должно быть отдельным."
-            )
-
+        superset_info = self._build_superset_info(use_supersets, wellbeing=True)
         workout_history_info, exercises_info = await self._get_workout_history_info(user["id"])
 
         prompt = build_wellbeing_workout_structured_prompt(
@@ -275,24 +157,8 @@ class AIService:
             exercises_info=exercises_info,
         )
 
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.4,
-            max_tokens=1100,
-            response_format={"type": "json_object"},
-        )
-
-        raw = (response.choices[0].message.content or "").strip()
-        parsed = self._extract_json_object(raw)
-        if not parsed:
-            raise RuntimeError("AI returned invalid JSON for wellbeing workout")
-
-        normalized = self._normalize_structured_workout(parsed, fallback_muscle_group=fallback_group)
-        return normalized
+        parsed = await self._parse(WorkoutAIOutput, prompt, temperature=0.4, max_tokens=1100)
+        return self._normalize_structured_workout(parsed, fallback_muscle_group=fallback_group)
 
     async def infer_manual_workout_metadata(
         self,
@@ -300,42 +166,11 @@ class AIService:
         exercises: list[dict[str, object]],
     ) -> dict[str, object]:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
         prompt = build_manual_workout_infer_prompt(user=user, exercises=exercises)
-
-        try:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=350,
-                response_format={"type": "json_object"},
-            )
-        except TypeError:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=350,
-            )
-
-        raw = (response.choices[0].message.content or "").strip()
-        parsed = self._extract_json_object(raw)
-        if not parsed:
-            raise RuntimeError("AI returned invalid JSON for manual workout inference")
-
-        if not isinstance(parsed, dict):
-            raise RuntimeError("AI returned invalid object for manual workout inference")
-
-        return parsed
+        parsed = await self._parse(WorkoutMetadataAIOutput, prompt, temperature=0.2, max_tokens=350)
+        return parsed.model_dump()
 
     async def generate_workout_exercise(
         self,
@@ -344,16 +179,10 @@ class AIService:
         existing_exercise_names: list[str],
     ) -> dict:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
         workout_history_info, _ = await self._get_workout_history_info(user["id"])
-        superset_info = (
-            "ВАЖНО: Пользователь отключил суперсеты. НЕ используй суперсеты. "
-            "Каждое упражнение должно быть отдельным."
-        )
-        if self._should_use_supersets(user):
-            superset_info = "Пользователь предпочитает интенсивные форматы тренировок. Суперсеты допустимы."
+        superset_info = self._build_superset_info(self._should_use_supersets(user))
 
         prompt = build_workout_single_exercise_prompt(
             user=user,
@@ -364,147 +193,27 @@ class AIService:
         )
 
         existing_lower = {n.lower().strip() for n in existing_exercise_names}
-        max_attempts = 3
-        temperature = 0.6
+        temperature = EXERCISE_REPLACE_TEMP_START
+        last_parsed: ExerciseAIOutput | None = None
 
-        for attempt in range(max_attempts):
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "Ты фитнес-бот. Возвращай только JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=temperature,
-                max_tokens=350,
-                response_format={"type": "json_object"},
-            )
+        for attempt in range(MAX_EXERCISE_REPLACE_ATTEMPTS):
+            parsed = await self._parse(ExerciseAIOutput, prompt, temperature=temperature, max_tokens=350)
+            last_parsed = parsed
 
-            raw = (response.choices[0].message.content or "").strip()
-            parsed = self._extract_json_object(raw)
-            if not parsed:
-                raise RuntimeError("AI returned invalid JSON for exercise")
+            if parsed.name.lower().strip() not in existing_lower:
+                return {"name": parsed.name.strip(), "weight_kg": parsed.weight_kg, "sets": parsed.sets, "reps": parsed.reps}
 
-            normalized = self._normalize_exercise(parsed)
-            if normalized["name"].lower().strip() not in existing_lower:
-                return normalized
+            logger.warning("exercise_replacement_duplicate attempt=%d name=%s", attempt + 1, parsed.name)
+            temperature = min(temperature + EXERCISE_REPLACE_TEMP_STEP, 1.0)
 
-            logger.warning(
-                "exercise_replacement_duplicate attempt=%d name=%s",
-                attempt + 1,
-                normalized["name"],
-            )
-            temperature = min(temperature + 0.15, 1.0)
+        return {"name": last_parsed.name.strip(), "weight_kg": last_parsed.weight_kg, "sets": last_parsed.sets, "reps": last_parsed.reps}
 
-        return normalized
+    # ------------------------------------------------------------------
+    # Manual workout analysis
+    # ------------------------------------------------------------------
 
-    async def generate_workout(
-        self,
-        user: dict,
-        target_muscle_group: str | None = None,
-        wellbeing_reason: str | None = None,
-    ) -> str:
+    async def analyze_manual_workout(self, workout_description: str, user: dict) -> ManualWorkoutAnalysisAIOutput:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
-            raise RuntimeError("OpenAI API key is missing")
-
-        exercise_count = random.randint(5, 8)
-        tip_type = random.choice(TIP_TYPES)
-        
-        attendance_data = await self._calculate_attendance(user["id"])
-        real_frequency = attendance_data["real_frequency"]
-        recommended_split = attendance_data["recommended_split"]
-        
-        use_supersets = self._should_use_supersets(user)
-        
-        custom_frequency = user.get("custom_split_frequency")
-        if custom_frequency is not None:
-            display_frequency = custom_frequency
-            display_split = WORKOUT_SPLITS.get(custom_frequency, recommended_split)
-        else:
-            display_frequency = real_frequency
-            display_split = recommended_split
-        
-        if target_muscle_group:
-            chosen_group = target_muscle_group
-        else:
-            chosen_group = random.choice(display_split)
-        
-        split_description = SPLIT_DESCRIPTIONS.get(display_frequency, SPLIT_DESCRIPTIONS[3])
-        split_type = "выбранный" if custom_frequency is not None else "рекомендованный"
-        split_info = (
-            f"ВАЖНО: Тренировка адаптирована под {split_type} сплит пользователя. "
-            f"Пользователь тренируется примерно {display_frequency} раз в неделю. "
-            f"{split_type.title()} сплит: {split_description}. "
-            f"Сегодня тренируем: {chosen_group}."
-        )
-        
-        if use_supersets:
-            superset_info = (
-                "Пользователь предпочитает интенсивные форматы тренировок. "
-                "Включи суперсеты там, где это уместно."
-            )
-        else:
-            superset_info = (
-                "ВАЖНО: Пользователь отключил суперсеты. НЕ используй суперсеты. "
-                "Каждое упражнение должно быть отдельным с отдыхом между подходами."
-            )
-        
-        workout_history_info, exercises_info = await self._get_workout_history_info(user["id"])
-        
-        prompt = build_workout_prompt(
-            user=user,
-            muscle_group=chosen_group,
-            exercise_count=exercise_count,
-            tip_type=tip_type,
-            split_info=split_info,
-            superset_info=superset_info,
-            workout_history_info=workout_history_info,
-            exercises_info=exercises_info
-        )
-
-        if wellbeing_reason:
-            wellbeing_block = (
-                "\n\nДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ:\n"
-                f"Пользователь не может выполнить полноценную тренировку по причине: {wellbeing_reason}.\n"
-                "Составь альтернативную тренировку с учётом этого ограничения.\n"
-            )
-            prompt = f"{prompt}{wellbeing_block}"
-        
-        logger.info(
-            "ai_generate_workout_request",
-            extra={
-                "user_id": user.get("id"),
-                "telegram_id": user.get("telegram_id"),
-                "chosen_group": chosen_group,
-                "exercise_count": exercise_count,
-                "use_supersets": use_supersets,
-                "custom_split_frequency": custom_frequency,
-            },
-        )
-
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "Ты фитнес-бот. Отвечай всегда только на русском языке."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.4,
-            max_tokens=1200
-        )
-        
-        workout_text = (response.choices[0].message.content or "").strip()
-        if not workout_text:
-            logger.error(
-                "ai_generate_workout_empty_response",
-                extra={"user_id": user.get("id"), "telegram_id": user.get("telegram_id")},
-            )
-            raise RuntimeError("AI returned empty workout")
-
-        return workout_text
-
-    async def analyze_manual_workout(self, workout_description: str, user: dict) -> str:
-        if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
         user_info = (
@@ -514,483 +223,115 @@ class AIService:
             f"Уровень: {user.get('level', 'не указан')}"
         )
 
-        prompt = f"""
-Пользователь выполнил тренировку: "{workout_description}"
-
-Информация о пользователе: {user_info}
-
-Проанализируй тренировку и верни JSON в следующем формате:
-{{
-  "improved_description": "Детальный план прошедшей тренировки",
-  "calories_burned": число_калорий,
-  "post_workout_advice": "Совет после тренировки"
-}}
-
-Требования:
-1. improved_description - создай ДЕТАЛЬНЫЙ ПЛАН прошедшей тренировки:
-   - тип тренировки
-   - список упражнений/нагрузки
-   - общее время
-   - целевые группы мышц
-2. calories_burned - если пользователь указал калории, используй это число, иначе оцени сам.
-3. post_workout_advice - дай полезный совет по восстановлению/питанию/следующим тренировкам.
-
-Отвечай только на русском языке.
-""".strip()
-
-        logger.info(
-            "ai_analyze_manual_workout_request",
-            extra={"user_id": user.get("id"), "telegram_id": user.get("telegram_id")},
+        prompt = (
+            f'Пользователь выполнил тренировку: "{workout_description}"\n'
+            f"Информация о пользователе: {user_info}\n\n"
+            "Требования:\n"
+            "1. improved_description — детальный план прошедшей тренировки (тип, упражнения, время, группы мышц).\n"
+            "2. calories_burned — оценка сожжённых калорий.\n"
+            "3. post_workout_advice — совет по восстановлению/питанию."
         )
 
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Ты персональный тренер и эксперт по фитнесу. Анализируй тренировки пользователей и возвращай только JSON.",
-                },
-                {"role": "user", "content": prompt},
-            ],
+        logger.info("ai_analyze_manual_workout", extra={"user_id": user.get("id")})
+        return await self._parse(
+            ManualWorkoutAnalysisAIOutput,
+            prompt,
+            system=MANUAL_WORKOUT_ANALYSIS_SYSTEM,
             temperature=0.4,
             max_tokens=900,
         )
 
-        result = (response.choices[0].message.content or "").strip()
-        if not result:
-            logger.error("ai_analyze_manual_workout_empty_response")
-            raise RuntimeError("AI returned empty manual workout analysis")
-        return result
+    # ------------------------------------------------------------------
+    # Food analysis
+    # ------------------------------------------------------------------
 
-    async def analyze_food_photo(self, image_url: str) -> str:
+    async def analyze_food_photo(self, image_url: str) -> FoodAnalysisAIOutput:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
-        logger.info("ai_analyze_food_request", extra={"image_url": image_url})
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": FOOD_ANALYSIS_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Проанализируй фото и верни JSON."},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                },
-            ],
-            max_tokens=500
+        logger.info("ai_analyze_food_photo", extra={"image_url": image_url[:80]})
+        return await self._parse_vision(
+            FoodAnalysisAIOutput,
+            system=FOOD_ANALYSIS_SYSTEM,
+            text=FOOD_ANALYSIS_USER,
+            image_url=image_url,
+            max_tokens=500,
         )
-        result = (response.choices[0].message.content or "").strip()
-        if not result:
-            logger.error("ai_analyze_food_empty_response", extra={"image_url": image_url})
-            raise RuntimeError("AI returned empty food analysis")
-        return result
 
-    async def analyze_food_with_clarification(
-        self,
-        image_url: str,
-        clarification: str
-    ) -> str:
-        prompt = FOOD_CLARIFICATION_PROMPT.format(clarification=clarification)
-        logger.info(
-            "ai_analyze_food_clarification_request",
-            extra={"image_url": image_url, "clarification_len": len(clarification)},
+    async def analyze_food_with_clarification(self, image_url: str, clarification: str) -> FoodAnalysisAIOutput:
+        logger.info("ai_analyze_food_clarification", extra={"image_url": image_url[:80]})
+        system = FOOD_CLARIFICATION_SYSTEM.format(clarification=clarification)
+        return await self._parse_vision(
+            FoodAnalysisAIOutput,
+            system=system,
+            text=clarification,
+            image_url=image_url,
+            max_tokens=500,
         )
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": clarification},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                },
-            ],
-            max_tokens=500
-        )
-        result = (response.choices[0].message.content or "").strip()
-        if not result:
-            logger.error(
-                "ai_analyze_food_clarification_empty_response",
-                extra={"image_url": image_url},
-            )
-            raise RuntimeError("AI returned empty food analysis")
-        return result
 
-    async def analyze_food_description(self, description: str) -> str:
-        """Analyze food from text description only (no photo)."""
+    async def analyze_food_description(self, description: str) -> FoodAnalysisAIOutput:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
-        system_prompt = """Ты эксперт по питанию. Пользователь описывает еду текстом.
-Оцени калорийность и БЖУ на основе описания.
-
-ВСЕГДА возвращай ответ в формате JSON:
-{
-  "description": "уточненное описание блюда",
-  "calories": число (ккал),
-  "proteins": число (г),
-  "fats": число (г),
-  "carbs": число (г)
-}
-
-Если описание слишком общее, сделай разумные предположения о порции (средняя порция).
-Возвращай ТОЛЬКО JSON, без markdown и пояснений."""
-
-        logger.info(
-            "ai_analyze_food_description_request",
-            extra={"description_len": len(description)},
-        )
-        
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": description},
-            ],
+        logger.info("ai_analyze_food_description", extra={"description_len": len(description)})
+        return await self._parse(
+            FoodAnalysisAIOutput,
+            description,
+            system=FOOD_DESCRIPTION_SYSTEM,
             temperature=0.3,
             max_tokens=300,
-            response_format={"type": "json_object"},
         )
-        
-        result = (response.choices[0].message.content or "").strip()
-        if not result:
-            logger.error("ai_analyze_food_description_empty_response")
-            raise RuntimeError("AI returned empty food analysis")
-        return result
 
-    async def calculate_kbju_targets(self, user: dict, nutrition_brief: dict) -> dict:
-        """Calculate personalized KBJU targets using AI."""
+    # ------------------------------------------------------------------
+    # Nutrition menus
+    # ------------------------------------------------------------------
+
+    async def generate_daily_menu_structured(
+        self,
+        user: dict,
+        nutrition_plan: dict,
+        day_name: str = "",
+    ) -> DailyMenuAIOutput:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
-        logger.info("ai_calculate_kbju_request", extra={"user_id": user.get("id")})
-
-        try:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": KBJU_CALCULATION_SYSTEM_PROMPT},
-                    {"role": "user", "content": build_kbju_calculation_prompt(user, nutrition_brief)},
-                ],
-                temperature=0.3,  # Lower temperature for more consistent calculations
-            )
-
-            raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-            
-            # Clean up markdown if present
-            if raw.startswith("```"):
-                raw = re.sub(r"^```(?:json)?\s*", "", raw)
-                raw = re.sub(r"\s*```$", "", raw)
-
-            parsed = json.loads(raw)
-            
-            # Validate required fields
-            required_fields = ["target_calories", "target_proteins", "target_fats", "target_carbs"]
-            for field in required_fields:
-                if field not in parsed:
-                    raise ValueError(f"Missing field: {field}")
-                parsed[field] = int(parsed[field])
-            
-            # Sanity checks
-            if parsed["target_calories"] < 1000 or parsed["target_calories"] > 5000:
-                logger.warning("ai_kbju_calories_out_of_range", extra={"calories": parsed["target_calories"]})
-            
-            logger.info(
-                "ai_calculate_kbju_success",
-                extra={
-                    "user_id": user.get("id"),
-                    "targets": {k: v for k, v in parsed.items() if k != "reasoning"},
-                },
-            )
-            
-            return parsed
-
-        except json.JSONDecodeError as e:
-            logger.error(
-                "ai_calculate_kbju_parse_failed",
-                extra={"user_id": user.get("id"), "error": str(e), "raw_preview": raw[:300] if raw else ""},
-            )
-            raise RuntimeError("AI returned invalid JSON for KBJU calculation")
-        except Exception as e:
-            logger.error(
-                "ai_calculate_kbju_error",
-                extra={"user_id": user.get("id"), "error": str(e)},
-            )
-            raise
-
-    async def generate_daily_menu(self, user: dict, nutrition_plan: dict) -> str:
-        """Legacy method for text-based menu generation."""
-        if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
-            raise RuntimeError("OpenAI API key is missing")
-
-        prompt = build_daily_menu_prompt(user, nutrition_plan)
-        logger.info("ai_generate_daily_menu_request", extra={"user_id": user.get("id")})
-
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
+        prompt = build_daily_menu_structured_prompt(user, nutrition_plan, day_name=day_name)
+        logger.info("ai_generate_daily_menu_structured", extra={"user_id": user.get("id"), "day_name": day_name})
+        return await self._parse(
+            DailyMenuAIOutput,
+            prompt,
+            system=DAILY_MENU_SYSTEM,
             temperature=0.8,
-            max_tokens=1500,
+            max_tokens=2000,
         )
-        menu_text = (response.choices[0].message.content or "").strip()
-        if not menu_text:
-            raise RuntimeError("AI returned empty daily menu")
-        return menu_text
-
-    async def generate_daily_menu_structured(self, user: dict, nutrition_plan: dict) -> dict:
-        """Generate structured JSON menu for the day."""
-        if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
-            raise RuntimeError("OpenAI API key is missing")
-
-        prompt = build_daily_menu_structured_prompt(user, nutrition_plan)
-        logger.info("ai_generate_daily_menu_structured_request", extra={"user_id": user.get("id")})
-
-        try:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.8,
-                max_tokens=2000,
-                response_format={"type": "json_object"},
-            )
-        except TypeError:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.8,
-                max_tokens=2000,
-            )
-
-        raw = (response.choices[0].message.content or "").strip()
-        if not raw:
-            raise RuntimeError("AI returned empty daily menu")
-
-        parsed = self._extract_json_object(raw)
-        if not parsed:
-            logger.error(
-                "ai_generate_daily_menu_structured_parse_failed",
-                extra={"user_id": user.get("id"), "raw_preview": raw[:300]},
-            )
-            raise RuntimeError("AI returned invalid JSON for daily menu")
-
-        return self._normalize_daily_menu(parsed, nutrition_plan)
-
-    def _normalize_daily_menu(self, raw: dict, nutrition_plan: dict) -> dict:
-        """Normalize and validate the AI-generated menu structure."""
-        target_calories = raw.get("target_calories") or nutrition_plan.get("target_calories") or 2000
-        target_proteins = raw.get("target_proteins") or nutrition_plan.get("target_proteins") or 100
-        target_fats = raw.get("target_fats") or nutrition_plan.get("target_fats") or 70
-        target_carbs = raw.get("target_carbs") or nutrition_plan.get("target_carbs") or 250
-
-        sections_raw = raw.get("sections", [])
-        if not isinstance(sections_raw, list):
-            sections_raw = []
-
-        valid_types = {"breakfast", "lunch", "dinner", "snacks"}
-        default_titles = {
-            "breakfast": "Завтрак",
-            "lunch": "Обед",
-            "dinner": "Ужин",
-            "snacks": "Перекусы",
-        }
-        default_time_ranges = {
-            "breakfast": "7:00-9:00",
-            "lunch": "12:00-14:00",
-            "dinner": "18:00-20:00",
-            "snacks": "В течение дня",
-        }
-
-        sections: list[dict] = []
-        for section_raw in sections_raw:
-            if not isinstance(section_raw, dict):
-                continue
-
-            section_type = section_raw.get("type", "")
-            if section_type not in valid_types:
-                continue
-
-            title = section_raw.get("title") or default_titles.get(section_type, "")
-            time_range = section_raw.get("time_range") or default_time_ranges.get(section_type, "")
-
-            items_raw = section_raw.get("items", [])
-            if not isinstance(items_raw, list):
-                items_raw = []
-
-            items: list[dict] = []
-            for item_raw in items_raw[:5]:
-                if not isinstance(item_raw, dict):
-                    continue
-
-                name = item_raw.get("name", "")
-                if not name or not isinstance(name, str):
-                    continue
-
-                calories = item_raw.get("calories", 0)
-                proteins = item_raw.get("proteins", 0)
-                fats = item_raw.get("fats", 0)
-                carbs = item_raw.get("carbs", 0)
-
-                items.append({
-                    "name": str(name).strip(),
-                    "calories": int(calories) if isinstance(calories, (int, float)) else 0,
-                    "proteins": int(proteins) if isinstance(proteins, (int, float)) else 0,
-                    "fats": int(fats) if isinstance(fats, (int, float)) else 0,
-                    "carbs": int(carbs) if isinstance(carbs, (int, float)) else 0,
-                })
-
-            if items:
-                sections.append({
-                    "type": section_type,
-                    "title": str(title).strip(),
-                    "time_range": str(time_range).strip(),
-                    "items": items,
-                })
-
-        tip_of_day = raw.get("tip_of_day", "")
-        if not isinstance(tip_of_day, str):
-            tip_of_day = "Пейте достаточно воды в течение дня."
-
-        return {
-            "target_calories": int(target_calories),
-            "target_proteins": int(target_proteins),
-            "target_fats": int(target_fats),
-            "target_carbs": int(target_carbs),
-            "sections": sections,
-            "tip_of_day": str(tip_of_day).strip() or "Пейте достаточно воды в течение дня.",
-        }
 
     async def generate_weekly_menu_structured(self, user: dict, nutrition_plan: dict) -> list[dict]:
-        """Generate structured JSON menu for 7 days (week)."""
+        """7 параллельных запросов — по одному на каждый день."""
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
-        prompt = build_weekly_menu_structured_prompt(user, nutrition_plan)
-        logger.info("ai_generate_weekly_menu_structured_request", extra={"user_id": user.get("id")})
-
-        try:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.8,
-                max_tokens=8000,
-                response_format={"type": "json_object"},
-            )
-        except TypeError:
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": DAILY_MENU_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.8,
-                max_tokens=8000,
-            )
-
-        raw = (response.choices[0].message.content or "").strip()
-        if not raw:
-            raise RuntimeError("AI returned empty weekly menu")
-
-        parsed = self._extract_json_array_or_object(raw)
-        if not parsed:
-            logger.error(
-                "ai_generate_weekly_menu_structured_parse_failed",
-                extra={"user_id": user.get("id"), "raw_preview": raw[:500]},
-            )
-            raise RuntimeError("AI returned invalid JSON for weekly menu")
-
-        return self._normalize_weekly_menu(parsed, nutrition_plan)
-
-    def _extract_json_array_or_object(self, raw: str) -> list | dict | None:
-        """Extract JSON array or object from raw response."""
-        # Try array first
-        array_start = raw.find("[")
-        array_end = raw.rfind("]")
-        if array_start != -1 and array_end != -1 and array_end > array_start:
-            try:
-                return json.loads(raw[array_start : array_end + 1])
-            except Exception:
-                pass
-        
-        # Fall back to object (might contain array inside)
-        obj_start = raw.find("{")
-        obj_end = raw.rfind("}")
-        if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
-            try:
-                result = json.loads(raw[obj_start : obj_end + 1])
-                # If object contains "days" or "week" array, extract it
-                if isinstance(result, dict):
-                    for key in ["days", "week", "menus", "menu"]:
-                        if key in result and isinstance(result[key], list):
-                            return result[key]
-                return result
-            except Exception:
-                pass
-        return None
-
-    def _normalize_weekly_menu(self, parsed: list | dict, nutrition_plan: dict) -> list[dict]:
-        """Normalize weekly menu to list of 7 day menus."""
         day_names = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
-        
-        # Convert to list if needed
-        if isinstance(parsed, dict):
-            # Single day - wrap in list
-            parsed = [parsed]
-        
-        if not isinstance(parsed, list):
-            raise RuntimeError("Weekly menu must be a list")
 
-        result: list[dict] = []
-        for i in range(7):
-            if i < len(parsed) and isinstance(parsed[i], dict):
-                day_menu = self._normalize_daily_menu(parsed[i], nutrition_plan)
-                day_menu["day_of_week"] = i
-                day_menu["day_name"] = day_names[i]
-            else:
-                # Generate empty placeholder for missing day
-                day_menu = {
-                    "day_of_week": i,
-                    "day_name": day_names[i],
-                    "target_calories": nutrition_plan.get("target_calories", 2000),
-                    "target_proteins": nutrition_plan.get("target_proteins", 100),
-                    "target_fats": nutrition_plan.get("target_fats", 70),
-                    "target_carbs": nutrition_plan.get("target_carbs", 250),
-                    "sections": [],
-                    "tip_of_day": "Пейте достаточно воды в течение дня.",
-                }
-            result.append(day_menu)
+        async def _gen_day(index: int, name: str) -> dict:
+            try:
+                parsed = await self.generate_daily_menu_structured(user, nutrition_plan, day_name=name)
+                result = parsed.model_dump()
+                result["day_of_week"] = index
+                result["day_name"] = name
+                return result
+            except Exception as exc:
+                logger.error("weekly_menu_day_failed day=%s error=%s", name, exc)
+                return self._empty_day_menu(index, name, nutrition_plan)
 
-        return result
+        tasks = [_gen_day(i, name) for i, name in enumerate(day_names)]
+        return list(await asyncio.gather(*tasks))
 
     async def generate_shopping_list(self, daily_menu: str) -> str:
         if not settings.openai_api_key:
-            logger.error("openai_api_key_is_missing")
             raise RuntimeError("OpenAI API key is missing")
 
         prompt = build_shopping_list_prompt(daily_menu)
-        logger.info("ai_generate_shopping_list_request")
+        logger.info("ai_generate_shopping_list")
 
         response = await client.chat.completions.create(
             model="gpt-4o",
@@ -1001,171 +342,140 @@ class AIService:
             temperature=0.4,
             max_tokens=800,
         )
-        shopping_list = (response.choices[0].message.content or "").strip()
-        if not shopping_list:
+        result = (response.choices[0].message.content or "").strip()
+        if not result:
             raise RuntimeError("AI returned empty shopping list")
-        return shopping_list
+        return result
 
-    async def _calculate_attendance(self, user_id: str) -> dict:
-        from datetime import datetime, timedelta
-        
-        try:
-            workouts = await supabase_client.get(
-                "workouts",
-                {
-                    "user_id": f"eq.{user_id}",
-                    "status": "eq.completed",
-                    "order": "date.desc",
-                    "limit": "100",
-                }
-            )
-            
-            if not workouts:
-                return {
-                    "real_frequency": 1,
-                    "total_workouts": 0,
-                    "average_weekly": 0,
-                    "recommended_split": WORKOUT_SPLITS[1]
-                }
-            
-            cutoff_date = datetime.utcnow() - timedelta(days=30)
-            recent_workouts = []
-            
-            for workout in workouts:
-                workout_date = datetime.fromisoformat(workout["date"])
-                if workout_date >= cutoff_date:
-                    recent_workouts.append(workout)
-            
-            total_workouts = len(recent_workouts)
-            weeks_in_period = 30 / 7
-            average_weekly = total_workouts / weeks_in_period if weeks_in_period > 0 else 0
-            
-            real_frequency = min(5, max(1, round(average_weekly)))
-            
-            return {
-                "real_frequency": real_frequency,
-                "total_workouts": total_workouts,
-                "average_weekly": round(average_weekly, 1),
-                "recommended_split": WORKOUT_SPLITS.get(real_frequency, WORKOUT_SPLITS[3])
-            }
-            
-        except Exception as e:
-            logger.exception("attendance_calculation_failed", extra={"user_id": user_id})
-            return {
-                "real_frequency": 3,
-                "total_workouts": 0,
-                "average_weekly": 0,
-                "recommended_split": WORKOUT_SPLITS[3]
-            }
+    # ------------------------------------------------------------------
+    # Trainer chat (streaming)
+    # ------------------------------------------------------------------
 
-    def _should_use_supersets(self, user: dict) -> bool:
-        if "supersets_enabled" in user and user["supersets_enabled"] is not None:
-            return user["supersets_enabled"]
-        
-        workout_formats = (user.get("workout_formats") or "").lower()
-        
-        superset_keywords = ["суперсет", "superset", "круговая", "circuit", "интенсив", "быстро"]
-        avoid_keywords = ["классическая", "отдых", "медленно", "новичок"]
-        
-        if "классическая" in workout_formats:
-            return False
-        
-        if user.get("level", "").lower() in ["новичок", "beginner"]:
-            return any(keyword in workout_formats for keyword in superset_keywords)
-        
-        if any(keyword in workout_formats for keyword in avoid_keywords):
-            return False
-        
-        return any(keyword in workout_formats for keyword in superset_keywords)
-
-    async def _get_workout_history_info(self, user_id: str) -> tuple[str, str]:
-        workouts = await supabase_client.get(
-            "workouts",
-            {
-                "user_id": f"eq.{user_id}",
-                "status": "eq.completed",
-                "order": "date.desc",
-                "limit": "3",
-            }
+    async def stream_chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.4,
+        max_tokens: int = 450,
+    ) -> AsyncGenerator[str, None]:
+        """Yield text chunks from a streaming chat completion."""
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
         )
-        
-        workout_history_info = ""
-        exercises_info = ""
-        
-        if workouts:
-            workout_history_info = "Последние тренировки пользователя:\n"
-            used_exercises = []
-            
-            for i, w in enumerate(workouts, 1):
-                date = w.get("date", "неизвестно")
-                workout_type = w.get("workout_type", "")
-                rating = w.get("rating")
-                details_text = self._details_to_text(w.get("details"))
-                details = details_text[:200]
-                
-                rating_text = f" (оценка: {rating}/5 ⭐)" if rating else " (оценка: не поставлена)"
-                comment = w.get("comment")
-                comment_text = f"\nКомментарий: {comment}" if comment else ""
-                workout_history_info += f"{i}. {date} - {workout_type}{rating_text}{comment_text}\n{details}\n\n"
-                
-                exercises = self._extract_exercise_names(details_text)
-                used_exercises.extend(exercises)
-            
-            workout_history_info += (
-                "Основываясь на этих данных, анализируй предпочтения пользователя по оценкам. "
-                "Учитывай что понравилось (высокие оценки) и что не понравилось (низкие оценки). "
-                "Особое внимание уделяй комментариям пользователя — они часто содержат конкретные причины недовольства."
-            )
-            
-            unique_exercises = list(set(used_exercises))
-            if unique_exercises:
-                exercises_info = (
-                    f"Упражнения из последних тренировок (по возможности избегай повторов): "
-                    f"{', '.join(unique_exercises)}."
-                )
-        
-        return workout_history_info, exercises_info
+        async for chunk in response:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
 
-    def _extract_exercise_names(self, details: str) -> list[str]:
-        lines = details.split('\n')
-        exercises = []
-        for line in lines:
-            match = re.match(r'\d+\.\s*([^\n]+)', line)
-            if match:
-                exercises.append(match.group(1).strip())
-        return exercises
+    async def generate_trainer_workout(
+        self,
+        chat_messages: list[dict[str, str]],
+    ) -> WorkoutAIOutput:
+        """Финализация чата с тренером: structured output для тренировки."""
+        response = await client.beta.chat.completions.parse(
+            model="gpt-4o",
+            messages=chat_messages,
+            response_format=WorkoutAIOutput,
+            temperature=0.4,
+            max_tokens=1100,
+        )
+        parsed = response.choices[0].message.parsed
+        if not parsed:
+            raise RuntimeError("AI returned invalid workout from trainer chat")
+        return parsed
 
-    def _extract_json_object(self, raw: str) -> dict | None:
-        json_start = raw.find("{")
-        json_end = raw.rfind("}")
-        if json_start == -1 or json_end == -1 or json_end <= json_start:
-            return None
-        try:
-            return json.loads(raw[json_start : json_end + 1])
-        except Exception:
-            return None
+    # ------------------------------------------------------------------
+    # Internal: structured output helpers
+    # ------------------------------------------------------------------
 
-    def _normalize_structured_workout(self, raw: dict, fallback_muscle_group: str) -> dict:
-        # Нормализуем к ожиданиям UI: фиксированный набор reps/weight_kg/sets.
-        allowed_reps = [5, 8, 10, 12, 15]
-        allowed_weight = [0, 2, 4, 6, 8, 10, 12, 16, 20, 25, 30, 40, 50]
-        allowed_sets = [2, 3, 4, 5, 6]
-        min_calories = 20
-        max_calories = 2000
+    async def _parse(
+        self,
+        schema: type,
+        user_prompt: str,
+        *,
+        system: str = "Ты фитнес-бот. Отвечай ТОЛЬКО на русском языке. Все названия упражнений, советы и текст — на русском.",
+        temperature: float = 0.4,
+        max_tokens: int = 1100,
+    ):
+        """Single-shot structured output via beta.chat.completions.parse."""
+        response = await client.beta.chat.completions.parse(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format=schema,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        parsed = response.choices[0].message.parsed
+        if not parsed:
+            refusal = response.choices[0].message.refusal
+            logger.error("ai_structured_output_failed schema=%s refusal=%s", schema.__name__, refusal)
+            raise RuntimeError(f"AI refused to generate {schema.__name__}: {refusal}")
+        return parsed
 
-        title = raw.get("title")
-        if not isinstance(title, str) or not title.strip():
-            title = "Тренировка"
+    async def _parse_vision(
+        self,
+        schema: type,
+        *,
+        system: str,
+        text: str,
+        image_url: str,
+        max_tokens: int = 500,
+    ):
+        """Structured output for vision (image) requests."""
+        response = await client.beta.chat.completions.parse(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": text},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                },
+            ],
+            response_format=schema,
+            max_tokens=max_tokens,
+        )
+        parsed = response.choices[0].message.parsed
+        if not parsed:
+            refusal = response.choices[0].message.refusal
+            logger.error("ai_vision_parse_failed schema=%s refusal=%s", schema.__name__, refusal)
+            raise RuntimeError(f"AI refused vision analysis: {refusal}")
+        return parsed
 
-        version = raw.get("version")
-        if not isinstance(version, int) or version < 1:
-            version = 1
+    # ------------------------------------------------------------------
+    # Internal: workout normalization (business-logic only)
+    # ------------------------------------------------------------------
 
-        muscle_groups = raw.get("muscle_groups")
-        if not isinstance(muscle_groups, list) or not muscle_groups:
-            muscle_groups = [str(fallback_muscle_group)]
-        muscle_groups = [str(x) for x in muscle_groups[:2]]
+    def _normalize_structured_workout(self, parsed: WorkoutAIOutput, fallback_muscle_group: str) -> dict:
+        exercises: list[dict] = []
+        seen_names: set[str] = set()
 
+        skip_prefixes = ("*", "совет", "важно", "следите", "не забудь", "обратите внимание", "рекоменд", "старайтесь", "помните")
+
+        for ex in parsed.exercises[:12]:
+            name = ex.name.strip()
+            name_lower = name.lower()
+
+            if any(name_lower.startswith(kw) for kw in skip_prefixes):
+                continue
+            if name_lower in seen_names:
+                continue
+            seen_names.add(name_lower)
+
+            exercises.append({"name": name, "weight_kg": ex.weight_kg, "sets": ex.sets, "reps": ex.reps})
+
+        if not exercises:
+            raise RuntimeError("structured workout has no valid exercises")
+
+        muscle_groups = [str(g) for g in parsed.muscle_groups[:2]]
         requested_parts = [p.strip().lower() for p in fallback_muscle_group.split(",") if p.strip()]
         if requested_parts:
             ai_lower = [g.lower() for g in muscle_groups]
@@ -1173,115 +483,158 @@ class AIService:
             if not has_overlap:
                 muscle_groups = [p.strip() for p in fallback_muscle_group.split(",") if p.strip()][:2]
 
-        exercises_raw = raw.get("exercises")
-        if not isinstance(exercises_raw, list) or not exercises_raw:
-            raise RuntimeError("structured workout has empty exercises")
+        calories = parsed.calories_burned
+        calories = max(MIN_CALORIES, min(MAX_CALORIES, calories)) if calories else None
 
-        exercises: list[dict] = []
-        seen_names: set[str] = set()
-        for item in exercises_raw[:12]:
-            if not isinstance(item, dict):
-                continue
-
-            name = item.get("name")
-            if not isinstance(name, str) or not name.strip():
-                continue
-
-            # Фильтруем советы/подсказки, которые AI иногда добавляет как упражнения
-            stripped = name.strip().lower()
-            if stripped.startswith("*") or stripped.startswith("совет") or stripped.startswith("важно"):
-                continue
-            skip_keywords = ("следите", "не забудь", "обратите внимание", "рекоменд", "старайтесь", "помните")
-            if any(stripped.startswith(kw) for kw in skip_keywords):
-                continue
-
-            reps = item.get("reps")
-            if not isinstance(reps, int):
-                reps = 12
-            reps = min(allowed_reps, key=lambda x: abs(x - reps))
-
-            sets = item.get("sets")
-            if not isinstance(sets, int):
-                sets = 3
-            sets = min(allowed_sets, key=lambda x: abs(x - sets))
-
-            weight = item.get("weight_kg")
-            if not isinstance(weight, int):
-                weight = 4
-            weight = min(allowed_weight, key=lambda x: abs(x - weight))
-
-            normalized_name = name.strip()
-            name_key = normalized_name.lower()
-            if name_key in seen_names:
-                continue
-            seen_names.add(name_key)
-
-            exercises.append(
-                {"name": normalized_name, "weight_kg": weight, "sets": sets, "reps": reps}
-            )
-
-        if not exercises:
-            raise RuntimeError("structured workout has no valid exercises")
-
-        calories_raw = raw.get("calories_burned")
-        calories_burned: int | None = None
-        if isinstance(calories_raw, bool):
-            calories_burned = None
-        elif isinstance(calories_raw, int):
-            calories_burned = calories_raw
-        elif isinstance(calories_raw, float):
-            calories_burned = int(calories_raw)
-        elif isinstance(calories_raw, str):
-            try:
-                calories_burned = int(float(calories_raw))
-            except Exception:
-                calories_burned = None
-
-        if isinstance(calories_burned, int):
-            calories_burned = max(min_calories, min(max_calories, calories_burned))
-        else:
-            calories_burned = None
-
-        # Обрабатываем wellbeing_advice для тренировок по самочувствию
-        wellbeing_advice_raw = raw.get("wellbeing_advice")
-        wellbeing_advice: str | None = None
-        if isinstance(wellbeing_advice_raw, str) and wellbeing_advice_raw.strip():
-            wellbeing_advice = wellbeing_advice_raw.strip()[:500]
+        wellbeing_advice = parsed.wellbeing_advice
+        if wellbeing_advice:
+            wellbeing_advice = wellbeing_advice.strip()[:500]
 
         return {
-            "version": int(version),
-            "title": str(title).strip(),
+            "version": 1,
+            "title": parsed.title.strip() or "Тренировка",
             "muscle_groups": muscle_groups,
             "exercises": exercises,
-            "estimated_calories": calories_burned,
+            "estimated_calories": calories,
             "wellbeing_advice": wellbeing_advice,
         }
 
-    def _normalize_exercise(self, raw: dict) -> dict:
-        allowed_reps = [5, 8, 10, 12, 15]
-        allowed_weight = [0, 2, 4, 6, 8, 10, 12, 16, 20, 25, 30, 40, 50]
-        allowed_sets = [2, 3, 4, 5, 6]
+    @staticmethod
+    def _empty_day_menu(index: int, name: str, nutrition_plan: dict) -> dict:
+        return {
+            "day_of_week": index,
+            "day_name": name,
+            "target_calories": nutrition_plan.get("target_calories", 2000),
+            "target_proteins": nutrition_plan.get("target_proteins", 100),
+            "target_fats": nutrition_plan.get("target_fats", 70),
+            "target_carbs": nutrition_plan.get("target_carbs", 250),
+            "sections": [],
+            "tip_of_day": "Пейте достаточно воды в течение дня.",
+        }
 
-        name = raw.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise RuntimeError("exercise has empty name")
+    # ------------------------------------------------------------------
+    # Internal: attendance & history helpers
+    # ------------------------------------------------------------------
 
-        reps = raw.get("reps")
-        if not isinstance(reps, int):
-            reps = 12
-        reps = min(allowed_reps, key=lambda x: abs(x - reps))
+    async def _calculate_attendance(self, user_id: str) -> dict:
+        from datetime import datetime, timedelta
 
-        sets = raw.get("sets")
-        if not isinstance(sets, int):
-            sets = 3
-        sets = min(allowed_sets, key=lambda x: abs(x - sets))
+        try:
+            workouts = await supabase_client.get(
+                "workouts",
+                {"user_id": f"eq.{user_id}", "status": "eq.completed", "order": "date.desc", "limit": "100"},
+            )
 
-        weight = raw.get("weight_kg")
-        if not isinstance(weight, int):
-            weight = 4
-        weight = min(allowed_weight, key=lambda x: abs(x - weight))
+            if not workouts:
+                return {"real_frequency": 1, "total_workouts": 0, "average_weekly": 0, "recommended_split": WORKOUT_SPLITS[1]}
 
-        return {"name": name.strip(), "weight_kg": weight, "sets": sets, "reps": reps}
+            cutoff_date = datetime.utcnow() - timedelta(days=30)
+            recent_workouts = [w for w in workouts if datetime.fromisoformat(w["date"]) >= cutoff_date]
+            total = len(recent_workouts)
+            avg_weekly = total / (30 / 7) if total else 0
+            real_frequency = min(5, max(1, round(avg_weekly)))
+
+            return {
+                "real_frequency": real_frequency,
+                "total_workouts": total,
+                "average_weekly": round(avg_weekly, 1),
+                "recommended_split": WORKOUT_SPLITS.get(real_frequency, WORKOUT_SPLITS[3]),
+            }
+        except Exception:
+            logger.exception("attendance_calculation_failed user_id=%s", user_id)
+            return {"real_frequency": 3, "total_workouts": 0, "average_weekly": 0, "recommended_split": WORKOUT_SPLITS[3]}
+
+    def _should_use_supersets(self, user: dict) -> bool:
+        if "supersets_enabled" in user and user["supersets_enabled"] is not None:
+            return user["supersets_enabled"]
+
+        workout_formats = (user.get("workout_formats") or "").lower()
+        superset_keywords = ["суперсет", "superset", "круговая", "circuit", "интенсив", "быстро"]
+
+        if "классическая" in workout_formats:
+            return False
+        if user.get("level", "").lower() in ["новичок", "beginner"]:
+            return any(kw in workout_formats for kw in superset_keywords)
+        if any(kw in workout_formats for kw in ["классическая", "отдых", "медленно", "новичок"]):
+            return False
+        return any(kw in workout_formats for kw in superset_keywords)
+
+    @staticmethod
+    def _build_superset_info(use_supersets: bool, *, wellbeing: bool = False) -> str:
+        if use_supersets:
+            base = "Пользователь предпочитает интенсивные форматы тренировок."
+            if wellbeing:
+                return f"{base} Суперсеты допустимы, но используй их осторожно с учётом самочувствия."
+            return f"{base} Включи суперсеты там, где это уместно."
+        return "ВАЖНО: Пользователь отключил суперсеты. НЕ используй суперсеты. Каждое упражнение должно быть отдельным с отдыхом между подходами."
+
+    def _details_to_text(self, details_value: object) -> str:
+        if details_value is None:
+            return ""
+        if isinstance(details_value, str):
+            return details_value
+        if isinstance(details_value, dict):
+            try:
+                from app.workouts.schemas import WorkoutStructured
+                from app.workouts.service import _format_workout_text
+
+                structured = WorkoutStructured.model_validate(details_value)
+                return _format_workout_text(structured)
+            except Exception:
+                try:
+                    import json
+                    return json.dumps(details_value, ensure_ascii=False)
+                except Exception:
+                    return str(details_value)
+        return str(details_value)
+
+    async def _get_workout_history_info(self, user_id: str) -> tuple[str, str]:
+        workouts = await supabase_client.get(
+            "workouts",
+            {"user_id": f"eq.{user_id}", "status": "eq.completed", "order": "date.desc", "limit": "3"},
+        )
+
+        workout_history_info = ""
+        exercises_info = ""
+
+        if workouts:
+            workout_history_info = "Последние тренировки пользователя:\n"
+            used_exercises: list[str] = []
+
+            for i, w in enumerate(workouts, 1):
+                date = w.get("date", "неизвестно")
+                workout_type = w.get("workout_type", "")
+                rating = w.get("rating")
+                details_text = self._details_to_text(w.get("details"))
+                details = details_text[:200]
+
+                rating_text = f" (оценка: {rating}/5)" if rating else " (оценка: не поставлена)"
+                comment = w.get("comment")
+                comment_text = f"\nКомментарий: {comment}" if comment else ""
+                workout_history_info += f"{i}. {date} - {workout_type}{rating_text}{comment_text}\n{details}\n\n"
+
+                exercises = self._extract_exercise_names(details_text)
+                used_exercises.extend(exercises)
+
+            workout_history_info += (
+                "Основываясь на этих данных, анализируй предпочтения пользователя по оценкам. "
+                "Учитывай что понравилось (высокие оценки) и что не понравилось (низкие оценки). "
+                "Особое внимание уделяй комментариям пользователя."
+            )
+
+            unique_exercises = list(set(used_exercises))
+            if unique_exercises:
+                exercises_info = f"Упражнения из последних тренировок (по возможности избегай повторов): {', '.join(unique_exercises)}."
+
+        return workout_history_info, exercises_info
+
+    @staticmethod
+    def _extract_exercise_names(details: str) -> list[str]:
+        return [
+            match.group(1).strip()
+            for line in details.split("\n")
+            if (match := re.match(r"\d+\.\s*([^\n]+)", line))
+        ]
+
 
 ai_service = AIService()
-
